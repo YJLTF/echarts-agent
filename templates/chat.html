@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ECharts Agent - 可视化对话</title>
+  <link rel="stylesheet" href="/static/app.css" />
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">EA</div>
+      <div class="brand-text">
+        <div class="brand-title">ECharts Agent</div>
+        <div class="brand-sub">数据可视化对话助手</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <a href="/" class="nav-item active">💬 对话</a>
+      <a href="/config" class="nav-item">⚙️ 配置</a>
+    </nav>
+
+    <div class="sidebar-section">
+      <div class="section-title">1. 上传或粘贴数据</div>
+      <div class="file-zone">
+        <label class="file-btn" title="支持 xlsx / xls / csv / json">
+          <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.json,.txt" />
+          📂 选择文件
+        </label>
+        <span id="fileName" class="file-name">未选择文件</span>
+      </div>
+      <textarea id="textInput" rows="4" placeholder="也可直接粘贴 CSV / JSON / 文本数据…"></textarea>
+      <div class="row">
+        <button class="btn btn-ghost" id="btnParse">🔍 解析数据</button>
+        <button class="btn btn-ghost" id="btnClearData">清空</button>
+      </div>
+      <pre id="dataPreview" class="data-preview hidden"></pre>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="section-title">2. 可选：指定图表样式</div>
+      <div class="row grid-2">
+        <label>主题
+          <select id="themeSel">
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </label>
+        <label>图表类型
+          <select id="typeSel">
+            <option value="">自动</option>
+            <option value="bar">柱状图 bar</option>
+            <option value="line">折线图 line</option>
+            <option value="pie">饼图 pie</option>
+            <option value="scatter">散点 scatter</option>
+            <option value="radar">雷达 radar</option>
+            <option value="gauge">仪表 gauge</option>
+            <option value="funnel">漏斗 funnel</option>
+            <option value="heatmap">热力 heatmap</option>
+            <option value="sunburst">旭日 sunburst</option>
+            <option value="treemap">树图 treemap</option>
+            <option value="sankey">桑基 sankey</option>
+            <option value="candlestick">K线 candlestick</option>
+            <option value="boxplot">箱线 boxplot</option>
+            <option value="effectScatter">涟漪 effectScatter</option>
+            <option value="pictorialBar">象形 pictorialBar</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label><input type="text" id="titleInput" placeholder="图表标题（可选）" /></label>
+      </div>
+    </div>
+
+    <div class="sidebar-section grow">
+      <div class="section-title">3. 发送需求</div>
+      <textarea id="promptInput" rows="5" placeholder="例如：用数据里的“月份”作为 X 轴，“销售额”作为 Y 轴，生成柱状图并平滑为圆角。"></textarea>
+      <div class="row">
+        <button class="btn btn-primary" id="btnGen">✨ 生成图表</button>
+        <button class="btn btn-ghost" id="btnSample">加载示例</button>
+      </div>
+      <div id="hintMsg" class="hint hidden"></div>
+    </div>
+
+    <div class="sidebar-footer">
+      <span class="dot"></span> 所有生成与配置均在本地完成（无需联网搜索）
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="main-head">
+      <div class="head-title">对话</div>
+      <div class="head-actions">
+        <button class="btn btn-ghost" id="btnExport">📥 导出代码</button>
+        <button class="btn btn-ghost" id="btnFullscreen">⛶ 全屏查看</button>
+      </div>
+    </header>
+
+    <section class="chart-area">
+      <div id="chart" class="chart"></div>
+    </section>
+
+    <section class="reply-area">
+      <div id="typeReason" class="reason hidden"></div>
+      <div class="tabs">
+        <button class="tab active" data-tab="explain">文字解释</button>
+        <button class="tab" data-tab="option">option JSON</button>
+        <button class="tab" data-tab="code">JS 代码</button>
+        <button class="tab" data-tab="raw">原始回复</button>
+      </div>
+      <div class="tab-panels">
+        <pre id="panel-explain" class="tab-panel active" data-panel="explain">尚未生成图表…</pre>
+        <pre id="panel-option" class="tab-panel" data-panel="option"></pre>
+        <pre id="panel-code" class="tab-panel" data-panel="code"></pre>
+        <pre id="panel-raw" class="tab-panel" data-panel="raw"></pre>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

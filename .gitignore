@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.vscode/
+.idea/
+app.db
+.env
+.env.local
+.DS_Store
+# 可能包含密钥的备份
+*.bak
