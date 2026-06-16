@@ -690,8 +690,6 @@ def api_chart_stream():
             "X-Powered-By": "echarts-agent",
         },
     )
-    # waitress / Flask: 每一次 yield 都立刻 flush，不要被 WSGI 缓冲
-    resp.direct_passthrough = True
     return resp
 
 
