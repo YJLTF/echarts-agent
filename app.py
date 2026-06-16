@@ -615,18 +615,20 @@ def api_chart_stream():
 
     return Response(
         generate(),
-        mimetype="text/event-stream",
+        content_type="text/event-stream; charset=utf-8",
         headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # 防止 nginx 等代理缓冲
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
         },
+        direct_passthrough=False,
     )
 
 
-def _sse_format_event(obj: dict) -> str:
-    """把一个事件 dict 格式化为 SSE 单行：``data: {json}\\n\\n``。"""
-    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+def _sse_format_event(obj: dict) -> bytes:
+    """把一个事件 dict 格式化为 SSE 单行 bytes：``data: {json}\\n\\n``。"""
+    return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
 # ---------------------- Chart Generation Pipeline ----------------------

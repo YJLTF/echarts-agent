@@ -199,12 +199,7 @@ class ChatOpenAIWrapper:
         max_t = max_tokens if max_tokens is not None else self.max_tokens
         temp = temperature if temperature is not None else self.temperature
 
-        # 构建 extra_body
-        extra_body: Dict[str, Any] = resolve_extra_kwargs(
-            self.base_url, reasoning_effort or self.reasoning_effort, self.provider
-        )
-
-        # 构建 chat messages
+        # 构建 LangChain messages
         from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
         langchain_messages: List[BaseMessage] = []
         for msg in messages:
@@ -215,17 +210,31 @@ class ChatOpenAIWrapper:
             else:
                 langchain_messages.append(HumanMessage(content=content))
 
-        response = llm.invoke(
-            langchain_messages,
-            config={"max_tokens": max_t, "temperature": temp},
+        # 用 .bind() 把参数绑定到 LLM 上
+        bind_kwargs: Dict[str, Any] = {"max_tokens": max_t, "temperature": temp}
+        # 结构化输出格式
+        if response_format is not None:
+            bind_kwargs["response_format"] = response_format
+        # reasoning_effort / thinking 等 provider 特有字段
+        extra_body = resolve_extra_kwargs(
+            self.base_url, reasoning_effort or self.reasoning_effort, self.provider
         )
+        if extra_body:
+            bind_kwargs["model_kwargs"] = extra_body
+
+        bound_llm = llm.bind(**bind_kwargs)
+        response = bound_llm.invoke(langchain_messages)
 
         content = ""
         reasoning = ""
         if isinstance(response, AIMessage):
             content = response.content or ""
-            # 尝试从 additional_kwargs 中获取 reasoning
-            reasoning = response.additional_kwargs.get("reasoning") or ""
+            # 从 additional_kwargs 中获取 reasoning / reasoning_content
+            reasoning = (
+                response.additional_kwargs.get("reasoning")
+                or response.additional_kwargs.get("reasoning_content")
+                or ""
+            )
 
         return content, reasoning
 
@@ -252,7 +261,19 @@ class ChatOpenAIWrapper:
                 langchain_messages.append(HumanMessage(content=content))
 
         llm = self._build_llm(stream=True)
-        for event in llm.stream(langchain_messages, config={"max_tokens": max_t, "temperature": temp}):
+
+        # 用 .bind() 绑定所有运行时参数
+        bind_kwargs: Dict[str, Any] = {"max_tokens": max_t, "temperature": temp}
+        if response_format is not None:
+            bind_kwargs["response_format"] = response_format
+        extra_body = resolve_extra_kwargs(
+            self.base_url, reasoning_effort or self.reasoning_effort, self.provider
+        )
+        if extra_body:
+            bind_kwargs["model_kwargs"] = extra_body
+
+        bound_llm = llm.bind(**bind_kwargs)
+        for event in bound_llm.stream(langchain_messages):
             if isinstance(event, AIMessage):
                 content = event.content or ""
                 if content:
