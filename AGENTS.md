@@ -1,15 +1,15 @@
 # AGENTS.md
 
-本项目是基于 Flask + 任意 OpenAI 兼容 LLM 的 ECharts 可视化 Agent。前端 `templates/chat.html`、后端 `app.py`、本地 ECharts 知识库 `knowledge.py`、数据解析 `data_parser.py` 与大模型数据整理 `data_understanding.py` 都在仓库根目录平铺，无包结构。
+本项目是基于 Flask + 任意 OpenAI 兼容 LLM 的 ECharts 可视化 Agent。前端 `templates/chat.html`、后端 `app.py`、本地 ECharts 知识库 `knowledge.py`、数据解析 `data_parser.py` 与大模型数据整理 `data_understanding.py` 都在仓库根目录平铺；**架构重构分支**新增了 `prompts/`、`chains/`、`tools/`、`agents/`、`memory/`、`output_parsers/` 六个 LangChain 分层。
 
 ## 环境
 
-- **必须使用** `F:\workspace\python\312_venv_echarts-agent` 下的 Python（3.12.9，已装 Flask 3.1.3 / flask-cors 6.0.5 / pandas 3.0.3 / openpyxl 3.1.5）。
+- **必须使用** `F:\workspace\python\312_venv_echarts-agent` 下的 Python（3.12.9，已装 Flask 3.1.3 / flask-cors 6.0.5 / pandas 3.0.3 / openpyxl 3.1.5 / langchain / langchain-core / langchain-community / pydantic）。
   调用方式：
   - PowerShell: `& "F:\workspace\python\312_venv_echarts-agent\Scripts\python.exe" app.py`
   - 或先 `& "F:\workspace\python\312_venv_echarts-agent\Scripts\Activate.ps1"`，再 `python app.py`。
 - **不要**用系统 `python` 或别的 venv 跑 —— 会出现找不到依赖或污染依赖的情况。
-- 没有 `pyproject.toml` / `requirements.txt` pin 之外的依赖；新加包请同时更新 `requirements.txt`。
+- 新加 LangChain 相关依赖见 `requirements.txt`（langchain / langchain-core / langchain-openai / langchain-community / pydantic）。**不要引入 langgraph / langsmith（本项目不做流式 + 链式调用）。
 
 ## 启动 & 验证
 
@@ -26,65 +26,104 @@
 - 无前端构建：`static/app.js`、`static/app.css` 是被 Flask 直接 `send_from_directory` 服务的纯静态文件；改完刷新页面即生效，**不要**引入 npm/webpack。
 - 无 DB 迁移：`init_db()` 用的 `CREATE TABLE IF NOT EXISTS`，改表结构时手动 `DROP TABLE` 或清掉 `app.db`。
 
-## 关键架构事实
+## 关键架构事实（LangChain 分层 v2）
 
-### 数据解析是「双层」
+本仓库采用 "原始 Flask + LangChain 分层"的混合实现：**核心业务流程不依赖 LangChain 模块**（在无网络/依赖缺失时也能跑起来），而**LangChain 模块提供的链/Tool/Memory/Agent 是可选可扩展点，用于扩展未来的 Agent 能力与对话记忆、LCEL 可组合的链式调用。
 
-1. `data_parser.py` —— 纯代码层（pandas / csv / json / 空格嗅探）。所有上传/粘贴的输入都先走这里，结果带 `raw_text`（原始文本片段）和 `source_ext` 字段。
-2. `data_understanding.py` —— 大模型二次理解层。前端勾选「🧠 用大模型智能整理」时调用，**也**在 `data.need_understanding=true` 提交到 `/api/chart` 时调用。
-   - LLM 输出严格 JSON：`{columns:[{name,type,role,description}], rows, summary, notes}`。
-   - 校验失败 / LLM 调用失败**自动回退**到代码解析结果，`understand_method` 标记为 `fallback`、错误写进 `understand_error`。
-   - 单位/千分位/百分号在 `_to_number()` 里被剥掉（`万/亿/%/元/¥` 等）。
+### LLM 调用：LangChain ChatOpenAIWrapper
+
+`llm_client.py` 暴露两类接口：
+- `call_llm(cfg, messages, ...)` / `call_llm(cfg, ...)` —— 向后兼容，**基于 urllib.request 的 OpenAI 兼容接口（不依赖 LangChain）。
+- `ChatOpenAIWrapper` 类 —— LangChain 风格 `ChatOpenAI` 实例封装，支持 `response_format` 参数、`provider` 嗅探、`reasoning_effort` / `thinking` 字段处理。
+- `get_llm_wrapper(cfg)` —— 获取全局单例 Wrapper（缓存 ChatOpenAI 实例）。
+
+Provider 推理深度（`_detect_provider`）：
+- **openai**（含 OpenAI / DeepSeek / 等 OpenAI 兼容服务）：`""` / `"off"` → 不发；`low` / `medium` / `high` → 透传 `reasoning_effort`
+- **ollama**（`:11434` / `/ollama`）：`""` / `"off"` → 显式发送 `reasoning_effort: "none"`；其它值透传
+- **glm**（`bigmodel.cn` / `zhipu`）：**字段名改为 `thinking` 对象 —— `""` / `"off"` → `thinking: {type: "disabled"}`；其它 → `thinking: {type: "enabled"}`
+
+推理响应的 `reasoning` / `reasoning_content` 字段会拼到 `raw_reply` 头部 `<think>...</think>`；`_parse_structured_chart` 解析前会把它剥掉。
 
 ### 知识库
 
-- `knowledge.py` 的常量（`GENERAL` / `TOOLTIP` / `LEGEND` / `AXIS` 等）是**真实**知识源。代码里 `KB_FILE = ".../knowledge_base.json"`，**这个 JSON 不存在也无所谓** —— `search_knowledge` / `get_knowledge_for_type` 找不到时会落到内置常量，运行时是好的。
-- 不要为了"修好" JSON 引用去 `git checkout` 一个 `knowledge_base.json`，它不是必需文件。
+- `knowledge.py` 的常量（`GENERAL` / `TOOLTIP` / `LEGEND` / `AXIS` 等）是**真实**知识源。`tools/knowledge.py` 把它封装为 LangChain Tool：
+  - `create_knowledge_tool()` 返回 `Tool` 实例，`search_knowledge` 也被 Tool 化。
+- `get_knowledge_for_type(chart_type)` 会按**按图表类型裁剪 KB**（pie/funnel/sankey 不发 axis，gauge/heatmap/candlestick/boxplot 不发 legend），节省 15-25% token。
 
-### 主生成 LLM 输出：结构化输出 + 三层兜底
+### 数据解析：双层
 
-主生成阶段（`run_chart_pipeline` 第 5 步）调 LLM 时带 **`_CHART_RESPONSE_SCHEMA`**（`response_format: {type: "json_schema", ...}`），强制模型按 `{option: {...}, content: "..."}` 单层 JSON 输出。`llm_client.call_llm` / `call_llm_stream` 还会做 **服务端降级链** `json_schema → json_object → 不带`（HTTP 400/422 含 `response_format` 关键词触发）。
+1. `data_parser.py` —— 纯代码层（pandas / csv / json / 空格嗅探）。结果带 `raw_text`（原始文本片段）和 `source_ext` 字段。
+2. `data_understanding.py` —— 大模型二次理解层。前端勾选「🧠 用大模型智能整理」时调用，**也**在 `data.need_understanding=true` 提交到 `/api/chart` 时调用。
+   - LLM 输出严格 JSON：`{columns:[{name,type,role,description}], rows, summary, notes}`。
+   - 校验失败 / LLM 调用失败**自动回退**到代码解析结果，`understand_method` 标记为 `fallback`、错误写进 `understand_error`。
 
-后端 `_parse_structured_chart(raw)` 按这个顺序兜底解析：
+### 图表生成 Pipeline（LangChain 链 + 结构化输出
 
-1. **主路径**：`json.loads(raw)` 一次 → 拿 `(option, content)`。`parse_method = "primary"`
-2. **围栏**：扫 ` ```json...``` ` 围栏，里面已是 `{option, content}` → `parse_method = "fence_full"`；里面只是裸 ECharts option → 整段当 option，**围栏外文字**当 content → `parse_method = "fence_option"`
-3. **content 抽取**：对象是 ECharts option 形态（`series`/`title`/...）且顶层有 `content` 字符串字段 → 抽出 `content`、剩余当 option → `parse_method = "in_option"`（围栏变种为 `"fence_in_option"`）
+`chains/pipeline.py: run_chart_pipeline(cfg, prompt, data, chart_type_hint, style_hint, *, stream=False)` 是核心：
 
-ECharts option schema 里**没有** `content` 字段，所以"从 option 里抽 `content`"是安全的。
+```
+┌─1) 数据准备（瞬时）
+├─2) 智能数据整理（复用 / 调一次 LLM / 跳过）
+├─3) 数据预处理（本地规则，<50ms）
+├─4) 选择图表类型（调一次 LLM，可被 chart_type_hint 覆盖）
+└─5) 主生成（流式调用 / 解析）
+       ↓
+   SSE 事件流：stage / delta / done / error
+```
 
-`done` 事件里带 `parse_method: primary / in_option / fence_full / fence_option / fence_in_option` —— 前端非 `primary` 时在顶部理由行显示「⚠ LLM 偏离 schema」红色徽章。
+阶段 2 触发条件（按优先级）：
+- 数据已有 `understand_method ∈ {llm, fallback} → **直接复用**，不重跑
+- 提交时 `data.need_understanding=true` → 调一次
+- 都没有 → `skipped`
 
-**注意**：本项目**没有自动重试**（之前老版本有 `_retry_parse_json` 调一次 LLM 重写，已删除）；结构化输出靠服务端兜底解析，不再让 LLM 再写一遍。
+主生成 LLM 调用 `_CHART_RESPONSE_SCHEMA`（`json_schema` 严格模式，强制 `{option: object, content: string}`）。
+
+### Prompt 管理
+
+`prompts/` 提供：
+- `data_understanding.py` —— `SYSTEM_PROMPT` + 模板化用户输入（cols / rows / hint / raw 等）。
+- `chart_type.py` —— 图表类型选择模板。
+- `chart_generation.py` —— `build_chart_user_prompt(prompt, data, chart_type, style_hint, knowledge, preprocess_info)`。
+
+全部用 LangChain 的 `ChatPromptTemplate` / `SystemMessagePromptTemplate` / `HumanMessagePromptTemplate` 组成。
+
+### 结构化输出 + 5 层兜底（`output_parsers/chart_parser.py`）
+
+解析顺序：
+1. `json.loads(raw)` → 拿 `(option, content)` → `parse_method = "primary"`
+2. 扫 ` ```json...``` ` 围栏 → 围栏里是 `{option, content}` → `parse_method = "fence_full"`
+3. 围栏里只是裸 ECharts option → `parse_method = "fence_option"`
+4. 对象是 ECharts option 形态且顶层有 `content` → 抽出 `content` → `parse_method = "in_option"`
+5. 围栏 + content-in-option 变种 → `parse_method = "fence_in_option"`
+6. 还不行 → 返回 `(None, None, None, error)`；前端根据 `error` 做 502 拒绝。
+
+`done` 事件带 `parse_method` 字段，前端非 `primary` 时在顶部理由行显示「⚠ LLM 偏离 schema」红色徽章。
 
 ### 前端与后端的契约
 
-- `/api/parse`：multipart 提交 `file` 或 `text`；可选 `use_llm=1` + `hint=<用户需求>`。返回里 `columns` 既可能是字符串列表（旧格式），也可能是 `[{name,type,role,description}]`（LLM 整理后）；`llm_client.py:build_chart_prompt` 已经兼容两种。
+- `/api/parse`：multipart 提交 `file` 或 `text`；可选 `use_llm=1` + `hint=<用户需求>`。返回里 `columns` 既可能是字符串列表（旧格式），也可能是 `[{name,type,role,description}]`（LLM 整理后）；`llm_client.py:build_chart_prompt` 已兼容两种。
 - `/api/chart` 与 `/api/chart/stream`：body 解析在 `_parse_chart_request()` 里统一做（缺 prompt 又缺 data 时 400）。两者共用同一个 `run_chart_pipeline`；stream 走 SSE 推 stage/delta/done 事件。
 - `done` 事件字段：`{ chart_type, type_reason, option, code, content, explanation, raw_reply, parse_method, understanding?, preprocess? }`。`explanation` 是 `content` 的兼容别名（老前端 / 历史消息用）。
-- 前端 `static/app.js` 把 `useLlmChk` 复选框状态、清空按钮、生成按钮提示都集中管理；改交互时优先看这里。
-- 静态资源限速：`MAX_CONTENT_LENGTH = 50 * 1024 * 1024`（50MB），改大要同步考虑 LLM token 预算。
+- 静态资源限速：`MAX_CONTENT_LENGTH = 50 * 1024 * 1024`（50MB）。
 
-### LLM 调用
+### LangChain 模块的使用方式
 
-- 全部走 `urllib.request` 调 OpenAI 兼容 `/chat/completions`（无 `requests` 依赖），超时 300s；详见 `llm_client.py: call_llm`。
-- `call_llm` / `call_llm_stream` 共享 `_post_chat_completion` / `_build_payload` / `_extract_content_text` 三个 helper；`_should_drop_response_format` 判定服务端拒绝 `response_format` 时按 `json_schema → json_object → 不带` 降级。
-- 推理深度控制：DB 字段 `llm_thinking` 接受 `""` / `"off"` / `"low"` / `"medium"` / `"high"`（白名单见 `_LLM_THINKING_ALLOWED`）。`build_llm_cfg()` 把它转成 `cfg["reasoning_effort"]`，并叠加 `cfg["provider"]`（由 `_detect_provider(base_url)` 自动嗅探）。`_resolve_thinking_field` 按 provider 把 `llm_thinking` 翻译成 ``(field, value)`` 元组写到 payload：
-  - **provider = openai**（含 OpenAI / DeepSeek / DashScope / Qwen 等兼容服务）：`""` / `"off"` → **不发送**；`"low"` / `"medium"` / `"high"` → 透传 `reasoning_effort`
-  - **provider = ollama**（Base URL 含 `:11434` 或路径含 `/ollama`）：`""` / `"off"` → 发 `reasoning_effort: "none"` 显式关闭（Ollama 缺省 ≠ 关闭，不发反而会思考）；`"low"` / `"medium"` / `"high"` → 透传
-  - **provider = glm**（Base URL 含 `bigmodel.cn` / `zhipu` / `zhipuai`）：**字段名换为 `thinking`** —— `""` / `"off"` → `thinking: {type: "disabled"}`；`"low"` / `"medium"` / `"high"` → `thinking: {type: "enabled"}`（GLM 无粒度差异，统一开启；仅 GLM-4.5+ 生效）
-  - 非法值归一化成空（最终按上面规则处理）
-- 推理响应：Ollama / GLM / OpenAI 推理模式会在响应里带 `reasoning` 或 `reasoning_content` 字段。`call_llm_raw` 返回 `(content, reasoning)`；主生成路径把 `<think>reasoning</think>` 拼到 `raw_reply` 头部，让用户能在「原始回复」tab 看到思考过程。`_parse_structured_chart` 在解析前先把 `<think>...</think>` 块剥掉，避免污染 JSON 解析。
-- 嗅探规则（`_detect_provider`）：匹配 `bigmodel.cn` / `zhipu` / `zhipuai` → `glm`；`:11434` / `/ollama` → `ollama`；其它 → `openai`。服务端忽略未知字段（`reasoning_effort` 对非推理模型是 no-op），不报错。
-- 配 Anthropic 兼容时会被 `_extract_content_text` 的 list 分支识别（`content` 字段是 list），但默认按 OpenAI 走。
+| 模块 | 文件 | 典型用法 | 备注 |
+| --- | --- | --- | --- |
+| **Prompt** | `prompts/*.py` | `build_data_understanding_prompt()` 返回 `ChatPromptTemplate` | 模板化的用户输入由 `format_data_understanding_input()` 组装 |
+| **Chain** | `chains/*.py` | `run_chart_pipeline(...)` → 生成器产出 SSE 事件 | `chains/pipeline.py` 是主入口 |
+| **Tools** | `tools/*.py` | `create_knowledge_tool()` → `Tool` 实例 | 可组合进 Agent 做自主决策 |
+| **Agent** | `agents/dataviz_agent.py` | `run_dataviz_agent(cfg, user_input, data, chat_history)` | 当前为简化版：直接调 LLM（不需要 Tool 调用链路） |
+| **Memory** | `memory/chat_memory.py` | `ChatMemory("default")` 对象 | 会话级记忆（简化版，不依赖 LangChain） |
+| **Output Parsers** | `output_parsers/chart_parser.py` | `parse_chart_response(raw)` → `(option, content, parse_method, error)` | 5 层兜底 |
 
 ## 工作流注意
 
-- 修改 `data_parser.py` 的 `parse_text`：本分支里有一个我已修复的 `i` 名字未绑定的旧 bug（在「按空格分隔」分支），不要回退这个修复 —— 退回会导致纯空格分隔的文本数据解析抛 `cannot access local variable 'i'`。
-- 修改 `data_understanding.py` 的 prompt 时：`SYSTEM_PROMPT` 末尾要求「**只输出一个 JSON 对象**，不要任何解释、Markdown 代码块、注释或前后缀」。这块约束改了，JSON 抽取可能失效。
-- 修改 `_DEFAULT_SYSTEM_PROMPT` 时：示例必须**完整**用 `{option: {...}, content: "..."}` 包装形态（不要只写裸 ECharts option），不然 LLM 会学到错误模式把 `content` 塞进 option 内部。前端依赖 `parse_method` 字段给用户提示。
+- 修改 `data_parser.py` 的 `parse_text`：本分支里有一个我已修复的 `i` 名字未绑定的旧 bug（在「按空格分隔」分支），不要回退这个修复。
+- 修改 `data_understanding.py` 的 prompt 时：`SYSTEM_PROMPT` 末尾要求「**只输出一个 JSON 对象**，不要任何解释、Markdown 代码块、注释或前后缀」。这块约束改了，JSON 抽取可能失效。同时 `llm_client.py` 的 `build_chart_prompt` 末尾也有对应的约束。
+- 修改 Prompt 时记得同时看 `llm_client.py: pick_chart_type` 与 `build_chart_prompt` —— 它俩都假设 `data["columns"]` 可能是 schema dict 列表。
 - 修改前端样式：在 `static/app.css` 末尾追加即可；不要再拆出独立 CSS 文件。
-- 改 prompt 时记得同时看 `llm_client.py: pick_chart_type` 与 `build_chart_prompt` —— 它俩都假设 `data["columns"]` 可能是 schema dict 列表。
+- **不要**在主路径引入 `langchain.agents.initialize_agent`（仓库没装 langgraph / langsmith；现有 tools / langchain 完整 Agent 用的是 create_openai_functions_agent，但 **agent = 创建了独立版本与 chat openai 函数创建）。
 
 ## 调试技巧
 
@@ -93,7 +132,8 @@ ECharts option schema 里**没有** `content` 字段，所以"从 option 里抽 
   import sys; sys.path.insert(0, r"F:\project\echarts-agent")
   from data_parser import parse_data_text
   from data_understanding import _extract_json, _validate
-  from app import _parse_structured_chart  # 主生成的解析，3 种兜底
+  from output_parsers.chart_parser import parse_chart_response  # 新 5 层兜底
+  from agents.dataviz_agent import create_dataviz_agent
   ```
 - 启服务做端到端：`client = app.test_client()`，直接 `client.post("/api/parse", data={...}, content_type="multipart/form-data")`。
 - LLM 调用慢时默认会等 300s；测试用数据用 `< 30` 行的 CSV 即可。
@@ -101,8 +141,10 @@ ECharts option schema 里**没有** `content` 字段，所以"从 option 里抽 
   ```python
   import sys; sys.path.insert(0, r"F:\project\echarts-agent")
   from app import _parse_structured_chart
+  from chains.pipeline import run_chart_pipeline
   # 1a 主路径；1b 围栏 + 完整；1c 围栏 + 裸 option；1d content-in-option
-  # 2a  response_format 透传；2b 降级
-  # 3a  /api/chart 端到端 (parse_method=primary)；3b/3c parse_method 其它值
+  # 2a response_format 透传；2b 降级
+  # 3a /api/chart 端到端（parse_method=primary）；3b/3c parse_method 其它值
   ```
 - 数据库查看：`python -c "import sqlite3; c=sqlite3.connect('app.db'); print(list(c.execute('SELECT * FROM config')))"`
+- 看 LangChain 链运行：`from chains.understanding import build_data_understanding_chain; chain = build_data_understanding_chain(cfg); chain.invoke({"cols": [...], "rows": [...]})`

@@ -50,16 +50,34 @@
 ```
 echarts-agent/
 ├── app.py                # Flask 入口：路由 / 配置持久化 / chart 流水线 / SSE 流式输出
-├── llm_client.py         # OpenAI 兼容协议调用（非流式 + 流式）+ 图表类型推荐 + prompt 构造
+├── llm_client.py         # LangChain ChatOpenAI 封装：非流式 + 流式调用 + 图表类型推荐 + provider 思考链嗅探
 ├── data_parser.py        # Excel / CSV / JSON / 文本表格统一解析（代码层）
 ├── data_understanding.py # 大模型数据整理：理解不规范数据并输出规范 schema + rows
 ├── data_preprocessing.py # 规则引擎：识别「保留 N 位小数 / 前 N 大 / 去除空值…」并本地改写
 ├── knowledge.py          # 本地配置项知识库（bar/line/pie/...15 种图表）
-├── requirements.txt      # Python 依赖清单
+├── prompts/              # LangChain PromptTemplate 集中管理（重构后新增）
+│   ├── data_understanding.py  # 数据理解 prompt（系统 + 用户模板）
+│   ├── chart_type.py          # 图表类型选择 prompt
+│   └── chart_generation.py    # 图表生成 prompt（带预处理/KB 注入）
+├── chains/               # LangChain LCEL Chain（重构后新增）
+│   ├── understanding.py  # 数据理解链：format_input | prompt | llm | StrOutputParser | parse_output
+│   ├── chart_generation.py  # 图表生成链（简化版）
+│   └── pipeline.py       # 统一的 6 阶段流水线生成器（prepare/understand/preprocess/pick_type/generate/parse）
+├── tools/                # LangChain Tools 封装（重构后新增）
+│   ├── knowledge.py      # ECharts 知识库检索工具
+│   ├── preprocessor.py   # 数据预处理工具
+│   └── chart_selector.py # 图表类型选择工具
+├── agents/               # LangChain Agent 模块（重构后新增，当前为简化版）
+│   └── dataviz_agent.py  # DataViz Agent 定义
+├── memory/               # LangChain Memory 管理（重构后新增）
+│   └── chat_memory.py    # 对话记忆管理
+├── output_parsers/       # 结构化输出解析器（重构后新增，原 llm_client._parse_chain 迁移至此）
+│   └── chart_parser.py   # ECharts option 解析 + JSON schema 校验 + 5 层兜底
+├── requirements.txt      # Python 依赖清单（含 langchain / langchain-core / langchain-openai）
 ├── scripts/
 │   └── download_vendor.py  # 把 ECharts 等下载到 static/vendor/（首装 / 升级用）
 ├── templates/
-│   └── chat.html         # 可视化对话页（含解析阶段 🧠 + 生成阶段 🧠 + 6 阶段进度面板 + 配置弹窗 + 多 sheet 选择器）
+│   └── chat.html         # 可视化对话页（含解析阶段 + 生成阶段 + 6 阶段进度面板 + 配置弹窗 + 多 sheet 选择器）
 └── static/
     ├── app.css           # 全站样式（含 prefers-reduced-motion / 暗色滚动条）
     ├── app.js            # 对话页 + 配置弹窗 + SSE 流式消费 + 进度面板渲染
@@ -67,6 +85,21 @@ echarts-agent/
         ├── echarts.min.js
         └── dark.js
 ```
+
+### 架构变更说明（v2 · 架构重构分支）
+
+`架构重构` 分支将原本集中在 `app.py` / `llm_client.py` 里的业务逻辑按 **LangChain 分层**重新组织：
+
+| 原位置 | 重构后位置 | 用途 |
+| --- | --- | --- |
+| `llm_client.py: call_llm / call_llm_stream` | `llm_client.py: ChatOpenAIWrapper` + `chains/*` | LangChain ChatOpenAI 实例 + LCEL 链组合 |
+| `llm_client.py: build_chart_prompt` / `data_understanding.py: SYSTEM_PROMPT` | `prompts/` | PromptTemplate 集中管理，便于版本化 |
+| `llm_client.py: _parse_structured_chart` | `output_parsers/chart_parser.py` | JSON schema 解析 + 5 层兜底（primary → fence_full → fence_option → in_option → fence_in_option） |
+| `knowledge.py: get_knowledge_for_type` | `tools/knowledge.py` | LangChain Tool 封装，可被 Agent 调用 |
+| `data_preprocessing.py: preprocess_data` | `tools/preprocessor.py` | 规则引擎 Tool 化 |
+| `app.py: run_chart_pipeline` | `chains/pipeline.py` | 6 阶段流水线生成器，以 event 形式产出 |
+
+向后兼容：`app.py` / `data_understanding.py` / `data_preprocessing.py` 的对外函数签名保持不变，现有 API（`/api/parse` / `/api/chart` / `/api/chart/stream`）无需调整。
 
 运行时会在项目根目录生成 `app.db`（SQLite，保存配置与对话历史），已在 `.gitignore` 中忽略。
 
