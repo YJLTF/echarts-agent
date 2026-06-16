@@ -215,12 +215,12 @@ class ChatOpenAIWrapper:
         # 结构化输出格式
         if response_format is not None:
             bind_kwargs["response_format"] = response_format
-        # reasoning_effort / thinking 等 provider 特有字段
+        # reasoning_effort / thinking 等 provider 特有字段通过 extra_body 传递
         extra_body = resolve_extra_kwargs(
             self.base_url, reasoning_effort or self.reasoning_effort, self.provider
         )
         if extra_body:
-            bind_kwargs["model_kwargs"] = extra_body
+            bind_kwargs["extra_body"] = extra_body
 
         bound_llm = llm.bind(**bind_kwargs)
         response = bound_llm.invoke(langchain_messages)
@@ -270,7 +270,7 @@ class ChatOpenAIWrapper:
             self.base_url, reasoning_effort or self.reasoning_effort, self.provider
         )
         if extra_body:
-            bind_kwargs["model_kwargs"] = extra_body
+            bind_kwargs["extra_body"] = extra_body
 
         bound_llm = llm.bind(**bind_kwargs)
         for event in bound_llm.stream(langchain_messages):
