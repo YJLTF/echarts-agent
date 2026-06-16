@@ -24,12 +24,21 @@
   - **支持中文数字写法**：`保留两位小数` / `前十` / `前十二大` 都能识别（`一月份` 这类列名不会被误改）
   - 预处理摘要会**附加到图表生成 prompt**，让 LLM 知道数据已经被改，并在 `tooltip/axisLabel` 里用一致精度
 - 🤖 **LLM 生成图表代码**：调用任意 OpenAI 兼容接口，返回标准 ECharts `option` 与可运行代码
+- 🧠 **思考链深度可控**：在「⚙️ 配置」里选 `关闭 / 低 / 中 / 高`，自动按 provider 翻译字段
+  - **OpenAI / DeepSeek / DashScope / Qwen 等兼容服务**：`reasoning_effort: low/medium/high`，关闭时不发送
+  - **Ollama**：自动嗅探 Base URL 含 `:11434` 或 `/ollama` → 关闭时发 `reasoning_effort: "none"`（Ollama 缺省 ≠ 关闭，不发反而会思考），其它值透传
+  - **智谱 GLM-4.5+**：自动嗅探 Base URL 含 `bigmodel.cn` / `zhipu` / `zhipuai` → 改用 `thinking: {type: "disabled"|"enabled"}` 对象；GLM 无 low/medium/high 粒度，统一 `enabled`
+  - 非推理模型被服务端忽略未知字段，不报错
+  - 思考过程会拼到 `raw_reply` 头部（`<think>...</think>` 块），在「原始回复」tab 可看
+- 🧱 **结构化输出（json_schema 严格模式）**：主生成 LLM 调用走 `response_format: json_schema`，强制模型按 `{option: {...}, content: "..."}` 单层 JSON 输出；服务端自动降级链 `json_schema → json_object → 不带`（服务端拒绝时），再降级到 ` ```json...``` ` 围栏兜底，再不行从裸 ECharts option 里抽出 `content` 字段
+  - **三种兼容形态都被自动识别**：① LLM 严格按 schema ② LLM 套围栏 ③ LLM 把 `content` 塞进 option 里
+  - `done` 事件里带 `parse_method: primary / in_option / fence_full / fence_option / fence_in_option` —— 前端非 `primary` 时显示「⚠ LLM 偏离 schema」徽章
 - 🧠 **智能图表类型推荐**：自动判断更适合用柱状图/折线图/饼图/散点图…
 - ⚙️ **配置弹窗**（不离开当前页）：点击主区右上「⚙️ 配置」即开，Esc / 背景 / ✕ 关闭；URL `pushState` 到 `/config` 保持可分享
 - 📊 **生成进度面板**（流式）：图表下方折叠面板，按 6 阶段（数据准备 → 智能整理 → 数据预处理 → 选类型 → 生成 → 解析）逐个高亮、✓ / ✕ / — 状态；生成阶段实时滚动模型 token；流式协议 `text/event-stream`，避免 nginx 代理缓冲
   - 长任务期间可随时点「✕ 取消」（`AbortController`）
   - 完成后显示耗时（`耗时 12s`）
-- 📋 **图表结果多视图**：文字解释 / option JSON / JS 代码 / 原始回复；首轮 JSON 解析失败会自动让 LLM 重写一次，成功时响应带 `retried: true` + 前端「🔁 已自动修正」徽章
+- 📋 **图表结果多视图**：文字解释 / option JSON / JS 代码 / 原始回复；每个 tab 都带「📋 复制」按钮（hover 浮出），复制后短暂变绿「✓ 已复制」
 - 📥 **导出独立 HTML**：完全自包含（自带 ECharts 主库 + dark 主题），可双击离线打开
 - 🎨 **可视化配置项知识库**：ECharts 配置项指导完全离线内置，**不会进行联网搜索**
 - ⌨️ **快捷键**：`Ctrl/⌘+Enter` 在 prompt / 数据输入框直接生成图表
@@ -89,7 +98,7 @@ PORT=8000 python3 app.py
    - Base URL：例如 `https://api.openai.com/v1` / `https://api.deepseek.com/v1` / `https://dashscope.aliyuncs.com/compatible-mode/v1` / `http://localhost:11434/v1`（Ollama）
    - API Key：对应平台的 Key（已配置的会以 `sk-***abcd` 掩码显示，「修改」按钮才会露出输入框）
    - 模型名：例如 `gpt-4o-mini` / `deepseek-chat` / `qwen-plus` / `glm-4.5-air` 等
-   - 可选：自定义 System Prompt、Temperature、Max Tokens
+   - 可选：自定义 System Prompt、Temperature、Max Tokens、**思考链深度**（`off` / `low` / `medium` / `high`，仅对推理模型生效）
    - 「🔌 测试连接」会**用表单当前值**直接调一次 LLM（不需要先保存）→ 确认后再「💾 保存」
 2. **再对话**：http://127.0.0.1:8080/
    - 上传文件（.xlsx/.xls/.csv/.json/.txt）或粘贴 CSV/JSON 数据
@@ -186,9 +195,29 @@ PORT=8000 python3 app.py
   - 都没有 → `skipped`
 - **阶段 3 触发条件**：从 prompt 里识别到任何支持的规则就执行，否则 `skipped`
 - **阶段 4**：用户在「图表类型」下拉里手动选了值就跳过 LLM 推荐
-- **阶段 5**：调用 LLM 的主生成；流式返回时把每个 token 推给前端。若首轮 JSON 解析失败，自动以 0.3 温度重试一次，成功时响应里带 `retried: true`，前端显示「🔁 已自动修正」徽章
+- **阶段 5（主生成）**：调用 LLM 时携带 `_CHART_RESPONSE_SCHEMA`（`json_schema` 严格模式，强制 `{option, content}` 形状）；流式返回时把每个 token 推给前端；不进行自动重试（结构化输出由服务端兜底，不需要 LLM 再写一次）
 - 主生成 LLM 调用 urlopen 超时 300s；Flask `threaded=True`，长请求不阻塞其他用户
 - SSE 响应带 `X-Accel-Buffering: no` 头，防止 nginx 等反向代理把流式响应攒成大块
+
+### 5. 结构化输出 + 自动兼容
+
+主生成阶段是 LLM 最容易"翻车"的一步：模型可能不响应 `response_format`、可能套 ` ```json ``` ` 围栏、可能把 `content` 塞进 ECharts option 内部。系统按这个顺序兜底：
+
+```
+1) 严格 schema（json_schema / json_object）
+   → json.loads 一次拿到 (option, content)        parse_method = primary
+2) 围栏兜底：扫 ```json...``` 围栏
+   ├─ 围栏里就是 {option, content}                parse_method = fence_full
+   └─ 围栏里只是裸 ECharts option                  parse_method = fence_option
+3) content 抽取：option 形态 + 顶层有 content 字段 → 抽出来
+                                                    parse_method = in_option
+4) 围栏 + content-in-option                        parse_method = fence_in_option
+5) 还不行 → 502 + raw_reply
+```
+
+ECharts option schema 里没有 `content` 字段，所以"把 content 从 option 里抽出来"是安全的；`parse_method` 透传到前端，非 `primary` 时顶部理由行显示「⚠ LLM 偏离 schema」红色徽章，提示用户调整 prompt。
+
+LLM 调用本身也有 `json_schema → json_object → 不带` 的三级降级（HTTP 400/422 关键词触发），覆盖了"服务端不响应结构化输出"的情况。
 
 ### 4. Prompt 构造
 
@@ -205,7 +234,8 @@ PORT=8000 python3 app.py
 
 ### 5. JSON 提取与渲染
 
-- 从模型返回的文本里，优先使用正则匹配 ````json ... ```` 代码块；匹配不到时取「第一个 `{` 到最后一个 `}`」作为候选 JSON；两者都失败则自动重试一次。
+- 主路径：`response_format=json_schema` 强制单层 JSON → `json.loads` 一次拿到 `(option, content)`。
+- 兜底：见上文「结构化输出 + 自动兼容」一节。
 - 前端拿到 option 后调用 `echarts.init(...).setOption(option)` 完成渲染。
 - 前端主题（Light / Dark）会在 `init` 时作为 `theme` 参数传入。
 - 切换主题时只 dispose+重建图表实例，**不重建 echarts listener**（resize handler 全程单例）
@@ -245,8 +275,8 @@ PORT=8000 python3 app.py
 | POST | `/api/config` | 存配置；`llm_api_key` 留空 / null / 缺失时**不覆盖**已存值 |
 | POST | `/api/config/test` | 测试 LLM 连接；body 可传当前表单值覆盖 DB，无需先保存 |
 | POST | `/api/parse` | 解析上传的文件或粘贴的数据；multipart form 字段：<br>• `file` 或 `text` 二选一<br>• `use_llm=1` 可选 · 启用 LLM 整理<br>• `no_header=1` 可选 · 首行是数据<br>• `selected_sheets=` 可选 · 复选框对应的 sheet 名（多 sheet 时）<br>• `hint=` 可选 · 用户意图，给 LLM 看的<br>返回 `{columns, rows, count, description, source, understand_method, summary, notes, code_parsed}` 或 `{needs_sheet_selection, sheets}` |
-| POST | `/api/chart` | 主生成接口（JSON 一次性返回，向后兼容）。body `{ prompt, data?, chart_type_hint?, style_hint? }`；`data.need_understanding=true` 会在生成前先让 LLM 整理数据。返回 `{ chart_type, option, code, explanation, raw_reply, understanding?, preprocess?, retried? }` |
-| POST | `/api/chart/stream` | **主生成接口（SSE 流式）**。body 同上；响应 `text/event-stream`，事件类型：<br>• `data: {"type":"stage","stage":"<name>","status":"start|done|skipped|error", ...}` — 各阶段状态变更<br>• `data: {"type":"delta","content":"..."}` — 主生成阶段模型 token 增量<br>• `data: {"type":"done","chart_type":...,"option":...,"code":...,"explanation":...,"understanding":...,"preprocess":...,"retried":bool}`<br>• `data: {"type":"error","message":"...","raw_reply":"..."}` — 失败事件 |
+| POST | `/api/chart` | 主生成接口（JSON 一次性返回，向后兼容）。body `{ prompt, data?, chart_type_hint?, style_hint? }`；`data.need_understanding=true` 会在生成前先让 LLM 整理数据。返回 `{ chart_type, option, code, content, explanation, raw_reply, parse_method, understanding?, preprocess? }`（`explanation` 是 `content` 的兼容别名） |
+| POST | `/api/chart/stream` | **主生成接口（SSE 流式）**。body 同上；响应 `text/event-stream`，事件类型：<br>• `data: {"type":"stage","stage":"<name>","status":"start|done|skipped|error", ...}` — 各阶段状态变更<br>• `data: {"type":"delta","content":"..."}` — 主生成阶段模型 token 增量<br>• `data: {"type":"done","chart_type":...,"option":...,"code":...,"content":...,"explanation":...,"parse_method":...,"understanding":...,"preprocess":...}`<br>• `data: {"type":"error","message":"...","raw_reply":"..."}` — 失败事件 |
 | GET | `/api/knowledge?q=...` 或 `?chart_type=...` | 查本地知识库 |
 | GET | `/api/chats` | 已有对话列表（当前默认只有一条 `default` 对话） |
 | GET | `/api/chats/<id>/messages` | 指定对话下的消息列表 |
@@ -310,13 +340,18 @@ waitress-serve --host 0.0.0.0 --port 8080 app:app
 | `app.py` | `_get_param` | 从 form / query / JSON body 中按优先级取参（Flask 缓存 `request.get_json()`，多次调用无开销） |
 | `app.py` | `now_iso` | 时区感知的 UTC ISO8601 时间戳（避免 `datetime.utcnow()` 的 deprecation warning） |
 | `app.py` | `run_chart_pipeline` | 6 阶段流水线生成器（prepare → understand → preprocess → pick_type → generate → parse）；`/api/chart` 消费 done 事件，`/api/chart/stream` 直接把事件转 SSE |
-| `app.py` | `_retry_parse_json` | 主生成 JSON 解析失败时**自动让 LLM 重写一次**（温度 0.3），通过 `yield from` 把 delta 事件透传；返回 `(new_raw, parsed, error_event)` 三元组 |
-| `app.py` | `extract_json` | 从 LLM 回复里抽 option / code / explanation；解析失败时先试 `_try_fix_json`（去尾随逗号 / 注释） |
-| `app.py` | `_scan_json_object` | 栈式扫描 raw 中第一个完整顶层 JSON 对象（处理字符串字面量与 `}` 转义），替代 `rfind('}')` 兜底切片；候选超 500KB 直接放弃 |
-| `app.py` | `_try_fix_json` | 修复 LLM 输出里最常见的 JSON 小毛病：行注释、块注释、尾随逗号 |
-| `app.py` | `_strip_js_functions` | 状态机抠出 `function (…) {…}` 字面量换占位符（UUID）让 `json.loads` 通过；前端按 `fn_map` 还原成真函数 |
-| `app.py` | `_build_retry_prompt` | 「上一轮回复无法解析」的修正 prompt 模板 |
-| `app.py` | `_DEFAULT_SYSTEM_PROMPT` | 默认 system prompt 含 6 条硬约束 + bar/line 最小可用结构示例；在 ⚙️ 配置里不填就用这个，填了则用用户的 |
+| `app.py` | `_parse_chart_request` | 抽出 `(prompt, data, chart_type_hint, style_hint)` 4 元组；`/api/chart` 与 `/api/chart/stream` 共用 |
+| `app.py` | `_sse_format_event` | 把事件 dict 格式化为 `data: {json}\n\n` 一行 SSE |
+| `app.py` | `_CHART_RESPONSE_SCHEMA` | 主生成 LLM 调用的 `json_schema` 严格模式 schema：顶层 `{option: object, content: string}`，option 用 `additionalProperties: true` 兜住 ECharts 任意字段 |
+| `app.py` | `_parse_structured_chart` | 主路径 + 围栏 + content-in-option 三层兜底，吐 `(option, content, method, error)` 四元组；`method` 给前端判定是否要"⚠ LLM 偏离 schema"徽章 |
+| `app.py` | `_strip_json_fence` | 扫 ` ```json...``` ` 围栏，返回 `(inside, outside)` |
+| `app.py` | `_DEFAULT_SYSTEM_PROMPT` | 默认 system prompt 含 6 条硬约束 + bar/line 完整 `{option, content}` 最小可用结构示例；在 ⚙️ 配置里不填就用这个，填了则用用户的 |
+| `app.py` | `wrap_code(option, llm_code, chart_type)` | 生成可在前端直接 `setOption(option)` 的 JS 代码（不再需要 fn_map） |
+| `llm_client.py` | `call_llm` / `call_llm_stream` | 非流式 / 流式调用；带 `response_format` 参数；服务端拒时按 `json_schema → json_object → 不带` 降级重试 |
+| `llm_client.py` | `_post_chat_completion` / `_build_payload` / `_extract_content_text` / `_should_drop_response_format` | call_llm / call_llm_stream 共用的 HTTP 入口、payload 拼装、响应解析、降级判断 |
+| `llm_client.py` | `pick_chart_type` | 让 LLM 推荐图表类型；用户手动选了 `chart_type_hint` 时直接跳过 |
+| `llm_client.py` | `compute_column_stats` | 给一份行数据算每列紧凑统计：<20 行不计算；<100 行只给 min/max/mean/distinct；≥100 行额外加 median / p25 / p75 / IQR |
+| `llm_client.py` | `build_chart_prompt` | 把数据 / 需求 / 样式 / KB 拼成最终给 LLM 的 user prompt；末尾约束「严格按 response_format schema 输出」 |
 | `data_parser.py` | `_read_excel_to_data` | 读单个 sheet；自动做日期启发式推断 |
 | `data_parser.py` | `_parse_json_object` | JSON → `{columns, rows, count}` 统一形态 |
 | `data_parser.py` | `_parse_multiple_sheets` | 多 sheet 合并，加 `__sheet__` 列 |
@@ -334,13 +369,11 @@ waitress-serve --host 0.0.0.0 --port 8080 app:app
 | `data_preprocessing.py` | `_is_numeric_col` | 判断一列是不是数值列（70% 阈值，可被字符串数字触发） |
 | `knowledge.py` | `get_knowledge_for_type` | **按图表类型裁剪 KB**：pie/funnel/sankey 不发 axis，gauge/heatmap/candlestick/boxplot 不发 legend，**单次 prompt 节省 15-25% token** |
 | `knowledge.py` | `CHART_USES_AXIS` | 各图表是否需要 xAxis/yAxis 的事实表 |
-| `llm_client.py` | `call_llm` / `call_llm_stream` | 非流式 / 流式调用；流式按 SSE 解析 `data: {json}\n\n`，遇 `application/json` 自动降级为一次性 yield |
-| `llm_client.py` | `pick_chart_type` | 让 LLM 推荐图表类型；用户手动选了 `chart_type_hint` 时直接跳过 |
-| `llm_client.py` | `compute_column_stats` | 给一份行数据算每列紧凑统计：<20 行不计算；<100 行只给 min/max/mean/distinct；≥100 行额外加 median / p25 / p75 / IQR，让 LLM 既看均值也看分布中段，**不被 outlier 带偏** |
-| `llm_client.py` | `build_chart_prompt` | 把数据 / 需求 / 样式 / KB 拼成最终给 LLM 的 user prompt |
+| `static/app.js` | `cachedEl(id)` | 懒填充的 DOM 缓存，避免 renderResponse / 复制按钮里反复 querySelector |
 | `static/app.js` | `buildChartBody()` | `/api/chart` 与 `/api/chart/stream` 共用的请求体构造（含「🧠 生成时整理」勾选逻辑） |
-| `static/app.js` | `consumeStream()` | 用 `ReadableStream.getReader()` 解析 SSE，按 `\n\n` 切事件，喂给 `handleStreamEvent` |
+| `static/app.js` | `consumeStream()` | 用 `ReadableStream.getReader()` 解析 SSE，按 `\n\n` 切事件，喂给 `handleStreamEvent`；不用 callback 状态机 |
 | `static/app.js` | `handleStreamEvent` | 单一入口处理所有 SSE 事件；`DETAIL_BY_STATUS` 表替代原本 60 行的 if/else |
+| `static/app.js` | `markAllStagesDone()` | 一次性把全部 6 阶段标 done（流式 / 兜底分支用） |
 | `static/app.js` | `setGenBusy(busy)` | 生成中禁用「生成图表」按钮 + 记录开始时间（用于显示耗时） |
 | `static/app.js` | `hideChartStatus()` | 隐藏顶部状态条；替代直接 `setChartStatus("", false)` 的 8 处调用 |
 | `static/app.js` | `ensureChart(theme)` | 同主题复用 / 异主题重建；不重复注册 resize listener |
@@ -348,6 +381,7 @@ waitress-serve --host 0.0.0.0 --port 8080 app:app
 | `static/app.js` | `buildParseFormData(opts)` | 解析提交的 FormData 构造一处搞定 |
 | `static/app.js` | `resetDataUI()` | 解析前的 UI 重置一处搞定 |
 | `static/app.js` | `submitParse(fd, btn)` | 提交流程 + 按钮 disabled 状态管理 |
+| `static/app.js` | `parseSseBlock` | 单个 SSE event 块 → JSON；只看 `data:` 行第一个 payload |
 
 ## 📜 License
 

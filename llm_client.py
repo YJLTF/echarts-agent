@@ -7,66 +7,188 @@ import ssl
 from typing import Dict, List, Optional, Any
 
 
-def call_llm(
-    cfg: Dict[str, Any],
-    messages: List[Dict[str, str]],
-    max_tokens: Optional[int] = None,
-    temperature: Optional[float] = None,
-) -> str:
+def _post_chat_completion(cfg: Dict[str, Any], payload: Dict[str, Any], stream: bool):
+    """统一的 chat/completions POST 入口。返回 ``urlopen`` 上下文对象。"""
     base_url = (cfg.get("base_url") or "").rstrip("/")
     api_key = cfg.get("api_key") or ""
-    model = cfg.get("model") or ""
-    if not base_url or not api_key or not model:
-        raise RuntimeError("LLM 配置不完整：需要 Base URL、API Key、Model。")
+    if not base_url or not api_key:
+        raise RuntimeError("LLM 配置不完整：需要 Base URL、API Key。")
     endpoint = f"{base_url}/chat/completions"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "text/event-stream" if stream else "application/json",
+    }
+    req = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+    ctx = ssl.create_default_context()
+    return urllib.request.urlopen(req, timeout=300, context=ctx)
 
-    payload = {
-        "model": model,
+
+def _should_drop_response_format(err: Exception) -> bool:
+    """HTTP 400 / 422 且错误文本里出现 response_format 相关字眼 → True。"""
+    msg = str(err) or ""
+    low = msg.lower()
+    if "response_format" not in low and "json_schema" not in low and "json_object" not in low:
+        return False
+    if "http 400" in low or "http 422" in low or "unsupported" in low or "unknown" in low or "invalid" in low:
+        return True
+    return False
+
+
+def _detect_provider(base_url: str) -> str:
+    """从 Base URL 嗅探 provider，用于调整 thinking 字段语义。
+
+    - 命中 ``:11434``（Ollama 默认端口）或路径里含 ``/ollama`` → ``"ollama"``
+    - 命中 ``bigmodel.cn`` / ``zhipu`` / ``zhipuai`` → ``"glm"``（智谱 GLM-4.5+）
+    - 其它 → ``"openai"``（含 OpenAI / DeepSeek / DashScope 等 OpenAI 兼容服务）
+    """
+    u = (base_url or "").lower()
+    if ":11434" in u or "/ollama" in u:
+        return "ollama"
+    if "bigmodel.cn" in u or "zhipuai" in u or "zhipu" in u:
+        return "glm"
+    return "openai"
+
+
+def _resolve_thinking_field(cfg: Dict[str, Any], user_value: Optional[str]):
+    """把 DB 里的 ``llm_thinking`` 按 provider 转成 ``(field, value)``，无则返回 ``None``。
+
+    Provider 差异：
+    - **openai**（含 DeepSeek / DashScope / Qwen 等 OpenAI 兼容）：``off`` → 不发送；
+      ``low``/``medium``/``high`` → 透传 ``reasoning_effort``
+    - **ollama**：``off`` → 发 ``reasoning_effort: "none"`` 显式关闭（Ollama 缺省≠关闭）；
+      其它值 → 透传
+    - **glm**（智谱 GLM-4.5+）：用 ``thinking: {type: "enabled" | "disabled"}`` 对象；
+      ``off`` → ``{type: "disabled"}``；其它值（low/medium/high）→ ``{type: "enabled"}``（GLM 无粒度，统一开启）
+    - 非法值 → ``None``
+    """
+    v = (user_value or "").strip().lower()
+    provider = (cfg.get("provider") or _detect_provider(cfg.get("base_url", ""))).lower()
+    if v in ("", "off"):
+        if provider == "ollama":
+            return ("reasoning_effort", "none")
+        if provider == "glm":
+            return ("thinking", {"type": "disabled"})
+        return None
+    if v in ("low", "medium", "high"):
+        if provider == "glm":
+            return ("thinking", {"type": "enabled"})
+        return ("reasoning_effort", v)
+    return None
+
+
+def _build_payload(
+    cfg: Dict[str, Any],
+    messages: List[Dict[str, str]],
+    max_tokens: Optional[int],
+    temperature: Optional[float],
+    response_format: Optional[Dict[str, Any]],
+    stream: bool,
+    reasoning_effort: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model": cfg.get("model") or "",
         "messages": messages,
     }
     if temperature is not None:
         payload["temperature"] = temperature
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if response_format is not None:
+        payload["response_format"] = response_format
+    thinking = _resolve_thinking_field(cfg, reasoning_effort)
+    if thinking is not None:
+        field, value = thinking
+        payload[field] = value
+    if stream:
+        payload["stream"] = True
+    return payload
 
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        endpoint,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"LLM 服务 HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')[:500]}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"无法连接 LLM 服务：{e}")
 
-    try:
-        obj = json.loads(raw)
-    except Exception as e:
-        raise RuntimeError(f"LLM 返回不是合法 JSON：{e}; body={raw[:500]}")
+def _extract_content_text(obj: Dict[str, Any]) -> str:
+    """从 chat/completions 响应里抠出 assistant 的文本内容。"""
+    if "choices" in obj and obj["choices"]:
+        msg = obj["choices"][0].get("message") or {}
+        return msg.get("content") or ""
+    if "content" in obj and isinstance(obj["content"], list):
+        return "".join((c.get("text") or "") for c in obj["content"])
+    if "content" in obj:
+        return str(obj["content"])
+    raise RuntimeError(f"未知响应结构：{json.dumps(obj)[:500]}")
 
-    # OpenAI / 兼容接口
-    try:
-        if "choices" in obj and obj["choices"]:
-            msg = obj["choices"][0].get("message") or {}
-            return msg.get("content") or ""
-        # Anthropic 兼容
-        if "content" in obj and isinstance(obj["content"], list):
-            return "".join((c.get("text") or "") for c in obj["content"])
-        if "content" in obj:
-            return str(obj["content"])
-        raise RuntimeError(f"未知响应结构：{raw[:500]}")
-    except (KeyError, TypeError) as e:
-        raise RuntimeError(f"解析 LLM 响应失败：{e}; body={raw[:500]}")
+
+def _extract_reasoning_text(obj: Dict[str, Any]) -> str:
+    """从响应里抽 ``reasoning`` / ``reasoning_content``（Ollama / OpenAI 推理模式都可能用）。
+
+    优先 ``choices[0].message.reasoning``，其次 ``reasoning_content``；返回空串表示没有。
+    """
+    if "choices" in obj and obj["choices"]:
+        msg = obj["choices"][0].get("message") or {}
+        return (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+    return ""
+
+
+def call_llm(
+    cfg: Dict[str, Any],
+    messages: List[Dict[str, str]],
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+    reasoning_effort: Optional[str] = None,
+) -> str:
+    """调用大模型（一次性）。**只返回 content 文本**，thinking 字段忽略。
+
+    完整响应解析需要 reasoning 时，用 :func:`call_llm_raw`。
+    """
+    content, _ = call_llm_raw(cfg, messages, max_tokens, temperature,
+                              response_format, reasoning_effort)
+    return content
+
+
+def call_llm_raw(
+    cfg: Dict[str, Any],
+    messages: List[Dict[str, str]],
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+    reasoning_effort: Optional[str] = None,
+) -> tuple[str, str]:
+    """调用大模型（一次性），返回 ``(content, reasoning)``。
+
+    - ``content``：assistant 的文本内容（用于 JSON 解析 / 选类型等）
+    - ``reasoning``：Ollama / OpenAI 推理模式下的思考过程（可空字符串）；
+      存进 ``raw_reply`` 给用户事后查看
+    """
+    base_url = (cfg.get("base_url") or "").rstrip("/")
+    api_key = cfg.get("api_key") or ""
+    model = cfg.get("model") or ""
+    if not base_url or not api_key or not model:
+        raise RuntimeError("LLM 配置不完整：需要 Base URL、API Key、Model。")
+
+    last_err: Optional[Exception] = None
+    cur_rf = response_format
+    raw = ""
+    for _ in range(3):
+        payload = _build_payload(cfg, messages, max_tokens, temperature, cur_rf, stream=False, reasoning_effort=reasoning_effort)
+        try:
+            with _post_chat_completion(cfg, payload, stream=False) as resp:
+                raw = resp.read().decode("utf-8")
+            obj = json.loads(raw)
+            return _extract_content_text(obj), _extract_reasoning_text(obj)
+        except urllib.error.HTTPError as e:
+            last_err = RuntimeError(f"LLM 服务 HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')[:500]}")
+            if cur_rf is not None and _should_drop_response_format(last_err):
+                cur_rf = {"type": "json_object"} if cur_rf.get("type") == "json_schema" else None
+                continue
+            raise last_err
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"无法连接 LLM 服务：{e}")
+        except Exception as e:
+            raise RuntimeError(f"LLM 返回不是合法 JSON：{e}; body={raw[:500]}")
+    if last_err:
+        raise last_err
+    raise RuntimeError("LLM 调用失败：未知原因")
 
 
 def call_llm_stream(
@@ -74,6 +196,8 @@ def call_llm_stream(
     messages: List[Dict[str, str]],
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+    reasoning_effort: Optional[str] = None,
 ):
     """流式调用大模型，逐 chunk 产出 content。
 
@@ -81,7 +205,10 @@ def call_llm_stream(
     - 走 OpenAI 兼容协议，请求时带 ``stream: true``，要求 ``text/event-stream``。
     - 按 SSE 规范解析 ``data: {json}`` 增量行，遇到 ``data: [DONE]`` 结束。
     - 如果服务端直接返回 ``application/json``（不支持流式），自动降级为一次性 yield 全部内容。
+    - ``response_format`` 服务端拒绝时按 ``json_schema`` → ``json_object`` → 不带降级重试一次；
+      流已开始则不再降级。
     - 与 ``call_llm`` 错误处理对齐：HTTP 错误抛 ``RuntimeError``，由调用方决定回退。
+    - ``reasoning_effort`` 与 ``call_llm`` 同义；空值不发送。
 
     Yields:
         str: 每次产出的 content delta（可能是空字符串，调用方需自行过滤）。
@@ -91,36 +218,26 @@ def call_llm_stream(
     model = cfg.get("model") or ""
     if not base_url or not api_key or not model:
         raise RuntimeError("LLM 配置不完整：需要 Base URL、API Key、Model。")
-    endpoint = f"{base_url}/chat/completions"
 
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-    }
-    if temperature is not None:
-        payload["temperature"] = temperature
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        endpoint,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "text/event-stream",
-        },
-        method="POST",
-    )
-    ctx = ssl.create_default_context()
-    try:
-        resp = urllib.request.urlopen(req, timeout=300, context=ctx)
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"LLM 服务 HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')[:500]}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"无法连接 LLM 服务：{e}")
+    last_err: Optional[Exception] = None
+    cur_rf = response_format
+    for _ in range(3):
+        payload = _build_payload(cfg, messages, max_tokens, temperature, cur_rf, stream=True, reasoning_effort=reasoning_effort)
+        try:
+            resp = _post_chat_completion(cfg, payload, stream=True)
+            break
+        except urllib.error.HTTPError as e:
+            last_err = RuntimeError(f"LLM 服务 HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')[:500]}")
+            if cur_rf is not None and _should_drop_response_format(last_err):
+                cur_rf = {"type": "json_object"} if cur_rf.get("type") == "json_schema" else None
+                continue
+            raise last_err
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"无法连接 LLM 服务：{e}")
+    else:
+        if last_err:
+            raise last_err
+        raise RuntimeError("LLM 调用失败：未知原因")
 
     content_type = (resp.headers.get("Content-Type") or "").lower()
     if "text/event-stream" not in content_type:
@@ -174,6 +291,10 @@ def call_llm_stream(
             content = delta.get("content")
             if content:
                 yield content
+            # 推理模型（Ollama / OpenAI o-series）会在 delta 里同时流 thinking；按需取
+            # reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+            # if reasoning:
+            #     yield ("reasoning", reasoning)
             # 部分实现在最后一个 chunk 把 finish_reason 放进 delta；这里不专门处理
     finally:
         try:
@@ -212,7 +333,13 @@ def pick_chart_type(
         "示例输出：\nbar\n用于比较不同类别之间的数值大小，适合该场景的分类数据对比。"
     )
     user = f"用户需求：{prompt or '根据提供的数据自动生成合适的图表'}{data_desc}\n\n请给出推荐图表类型与理由。"
-    reply = call_llm(cfg, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}], max_tokens=200, temperature=0.3)
+    reply = call_llm(
+        cfg,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=200,
+        temperature=0.3,
+        reasoning_effort=cfg.get("reasoning_effort") or None,
+    )
     lines = [ln.strip() for ln in reply.strip().splitlines() if ln.strip()]
     chart_type = lines[0].lower() if lines else "bar"
     allowed = {"bar","line","pie","scatter","radar","gauge","funnel","candlestick","heatmap","sunburst","treemap","sankey","boxplot","pictorialBar","effectScatter"}
@@ -378,13 +505,16 @@ def build_chart_prompt(
         pieces.append(f"样式偏好：{json.dumps(style_hint, ensure_ascii=False)}")
 
     pieces.append(
-        "请严格根据以下「ECharts 配置项指导」生成完整的 option JSON（不要写任何额外的字段注释，"
-        "保证 JSON 可直接由 JSON.parse 解析）。请确保：\n"
-        "1) series 中的 data 字段填入真实的数值数据；\n"
-        "2) xAxis/yAxis 或 legend 的内容与数据列名一致；\n"
-        "3) 标题 / 副标题可以留空；\n"
-        "4) 只输出一个 JSON 对象，用 ```json ... ``` 包裹。\n"
-        "5) 在 JSON 之后再用一小段中文解释该图表表达的要点。"
+        "请严格按 response_format 给定的 JSON schema 输出（不要写 Markdown 代码块、不要任何前后缀文字），"
+        "其中：\n"
+        "1) option 是完整的 ECharts 配置对象（title/tooltip/legend/grid/xAxis/yAxis/series/color 等），"
+        "series.data 填入真实数值；\n"
+        "2) xAxis/yAxis/legend 的内容与数据列名一致；\n"
+        "3) 标题/副标题可以留空；\n"
+        "4) 禁止 JS 函数字面量（JSON 不支持函数），自定义 formatter 用 ECharts 字符串模板"
+        "（如 '{b}: {c}'），自定义配色用 series 顶层 color: [...] 数组或省略；\n"
+        "5) content 字段填 30-80 字中文文字解释该图表表达的核心信息（最大/最小/趋势/对比），"
+        "不要复述数据，不要 markdown 格式。"
     )
 
     if knowledge:

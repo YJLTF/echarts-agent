@@ -215,10 +215,22 @@
         <button class="tab" data-tab="raw">原始回复</button>
       </div>
       <div class="tab-panels">
-        <pre id="panel-explain" class="tab-panel active" data-panel="explain">尚未生成图表…</pre>
-        <pre id="panel-option" class="tab-panel" data-panel="option"></pre>
-        <pre id="panel-code" class="tab-panel" data-panel="code"></pre>
-        <pre id="panel-raw" class="tab-panel" data-panel="raw"></pre>
+        <div class="tab-panel-wrap active" data-panel="explain">
+          <button class="tab-copy" data-copy-target="panel-explain" type="button" title="复制内容">📋 复制</button>
+          <pre id="panel-explain" class="tab-panel">尚未生成图表…</pre>
+        </div>
+        <div class="tab-panel-wrap" data-panel="option">
+          <button class="tab-copy" data-copy-target="panel-option" type="button" title="复制 JSON">📋 复制</button>
+          <pre id="panel-option" class="tab-panel"></pre>
+        </div>
+        <div class="tab-panel-wrap" data-panel="code">
+          <button class="tab-copy" data-copy-target="panel-code" type="button" title="复制代码">📋 复制</button>
+          <pre id="panel-code" class="tab-panel"></pre>
+        </div>
+        <div class="tab-panel-wrap" data-panel="raw">
+          <button class="tab-copy" data-copy-target="panel-raw" type="button" title="复制原始回复">📋 复制</button>
+          <pre id="panel-raw" class="tab-panel"></pre>
+        </div>
       </div>
     </section>
   </main>
@@ -259,7 +271,16 @@
         </label>
       </div>
 
-      <div class="form-group">
+      <div class="form-group grid-2">
+        <label>思考链深度
+          <select id="thinking">
+            <option value="off">关闭（不发送）</option>
+            <option value="low">低 · low</option>
+            <option value="medium">中 · medium</option>
+            <option value="high">高 · high</option>
+          </select>
+          <small>仅对推理模型生效（OpenAI o 系列 / DeepSeek-R1 / Qwen-QwQ 等）；非推理模型会被服务端忽略</small>
+        </label>
         <label>最大 Token（max_tokens）
           <input type="number" id="maxTokens" value="2048" />
         </label>
