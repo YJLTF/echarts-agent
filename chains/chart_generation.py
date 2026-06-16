@@ -1,154 +1,73 @@
 #!/usr/bin/env python3
-"""图表生成的 LCEL Chain。"""
+"""图表生成的 LCEL Chain（Pydantic 结构化输出版）。
+
+核心抽象：``prompt | llm | ChartGenerationResponse``。
+结构化输出失败时降级到手写解析（5 层兜底）。
+"""
+
+from __future__ import annotations
+
 import json
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
-
-from llm_client import get_llm_wrapper, compute_column_stats, call_llm_stream
+from llm_client import get_llm_wrapper
 from knowledge import get_knowledge_for_type
 from prompts.chart_generation import build_chart_user_prompt
-from output_parsers.chart_parser import parse_chart_response
+from output_parsers.schema import ChartGenerationResponse
+from chains.base import StructuredLLMChain
 
 
-# ECharts 响应 schema
-CHART_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "option": {
-            "type": "object",
-            "description": "ECharts 配置对象"
-        },
-        "content": {
-            "type": "string",
-            "description": "图表解读文字（30-80字中文）"
-        }
-    },
-    "required": ["option", "content"]
-}
+_DEFAULT_SYSTEM_PROMPT = (
+    "你是一个专业的 ECharts 图表生成助手，请根据用户需求生成符合规范的 ECharts 配置。"
+)
 
 
-def build_chart_generation_chain(cfg: Dict[str, Any]):
-    """构建图表生成的 LCEL 链。
+def _build_system_prompt(cfg: Dict[str, Any]) -> str:
+    """从 cfg 提取或使用默认 system prompt。"""
+    return cfg.get("system_prompt") or _DEFAULT_SYSTEM_PROMPT
 
-    Args:
-        cfg: LLM 配置字典
 
-    Returns:
-        一个 Runnable 对象
+# ========================================================================
+# Chain 构造
+# ========================================================================
+
+def build_chart_generation_chain(cfg: Dict[str, Any]) -> StructuredLLMChain:
+    """构建图表生成的 Chain（声明式的 ``prompt | llm | ChartGenerationResponse``）。
+
+    底层由 :class:`StructuredLLMChain` 提供：
+
+    - 优先走 ``ChatOpenAI.with_structured_output(ChartGenerationResponse)``
+      让 LLM 直接返回 Pydantic 对象，类型安全
+    - 失败时降级：普通 JSON mode → 不带 response_format → 手写 5 层解析
     """
-    wrapper = get_llm_wrapper(cfg)
-
-    def build_prompt(inputs: dict) -> dict:
-        """构建完整的用户 prompt。"""
-        prompt = inputs.get("prompt", "")
-        data = inputs.get("data")
-        chart_type = inputs.get("chart_type", "bar")
-        style_hint = inputs.get("style_hint")
-        knowledge = inputs.get("knowledge")
-        preprocess_info = inputs.get("preprocess_info")
-
-        user_prompt = build_chart_user_prompt(
-            prompt=prompt,
-            data=data,
-            chart_type=chart_type,
-            style_hint=style_hint,
-            knowledge=knowledge,
-            preprocess_info=preprocess_info,
-        )
-
-        return {
-            "user_prompt": user_prompt,
-            "system_prompt": cfg.get("system_prompt", ""),
-        }
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "{system_prompt}"),
-        ("human", "{user_prompt}"),
-    ])
-
-    def invoke_llm(inputs: dict) -> str:
-        """调用 LLM。"""
-        system = inputs.get("system_prompt", "") or (
-            "你是一个专业的 ECharts 图表生成助手，请根据用户需求生成符合规范的 ECharts 配置。"
-        )
-        user = inputs.get("user_prompt", "")
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-
-        return wrapper.call_llm(
-            messages=messages,
-            max_tokens=cfg.get("max_tokens", 2048),
-            temperature=cfg.get("temperature", 0.7),
-            response_format=CHART_RESPONSE_SCHEMA,
-            reasoning_effort=cfg.get("reasoning_effort"),
-        )
-
-    chain = (
-        RunnableLambda(build_prompt)
-        | prompt
-        | RunnableLambda(invoke_llm)
+    return StructuredLLMChain(
+        cfg=cfg,
+        system_prompt=_build_system_prompt(cfg),
+        output_model=ChartGenerationResponse,
     )
 
-    return chain
 
+# ========================================================================
+# 便捷调用（非流式）
+# ========================================================================
 
 def generate_chart(
     cfg: Dict[str, Any],
     prompt: str,
     data: Optional[Dict[str, Any]],
     chart_type: str = "bar",
-    style_hint: dict = None,
-    preprocess_info: dict = None,
-) -> tuple[Optional[dict], Optional[str], str]:
-    """生成图表的便捷函数。
+    style_hint: Optional[Dict[str, Any]] = None,
+    preprocess_info: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], str]:
+    """生成图表的便捷函数（非流式）。
 
     Returns:
-        (option, content, parse_method 或 error_message)
+        ``(option, content, parse_method_or_error_message)``
     """
     chain = build_chart_generation_chain(cfg)
 
-    # 获取知识库
+    # 组装用户输入
     knowledge = get_knowledge_for_type(chart_type)
-
-    input_data = {
-        "prompt": prompt,
-        "data": data,
-        "chart_type": chart_type,
-        "style_hint": style_hint,
-        "knowledge": knowledge,
-        "preprocess_info": preprocess_info,
-    }
-
-    try:
-        raw = chain.invoke(input_data)
-        option, content, parse_method, error = parse_chart_response(raw)
-        if error:
-            return None, None, error
-        return option, content, parse_method
-    except Exception as e:
-        return None, None, str(e)
-
-
-def generate_chart_stream(
-    cfg: Dict[str, Any],
-    prompt: str,
-    data: Optional[Dict[str, Any]],
-    chart_type: str = "bar",
-    style_hint: dict = None,
-    preprocess_info: dict = None,
-) -> Iterator[str]:
-    """流式生成图表。"""
-    wrapper = get_llm_wrapper(cfg)
-
-    # 获取知识库
-    knowledge = get_knowledge_for_type(chart_type)
-
     user_prompt = build_chart_user_prompt(
         prompt=prompt,
         data=data,
@@ -158,19 +77,70 @@ def generate_chart_stream(
         preprocess_info=preprocess_info,
     )
 
-    system_prompt = cfg.get("system_prompt", "") or (
-        "你是一个专业的 ECharts 图表生成助手。"
+    try:
+        result = chain.invoke(user_prompt)
+    except Exception as exc:
+        return None, None, f"llm_error: {exc}"
+
+    if isinstance(result, ChartGenerationResponse):
+        # Pydantic 模型 → 最理想的输出，解析方法 = structured
+        return result.option, result.content, "structured"
+
+    if isinstance(result, dict):
+        # 降级：从 dict 中抽取
+        return (
+            result.get("option"),
+            result.get("content"),
+            result.get("parse_method", "dict_fallback"),
+        )
+
+    # 字符串 → 交给 chart_parser 的 5 层兜底
+    from output_parsers.chart_parser import parse_chart_response as _parse
+    option, content, parse_method, error = _parse(result if isinstance(result, str) else repr(result))
+    if error:
+        return None, None, error
+    return option, content, parse_method or "raw_string"
+
+
+# ========================================================================
+# 便捷调用（流式）
+# ========================================================================
+
+def generate_chart_stream(
+    cfg: Dict[str, Any],
+    prompt: str,
+    data: Optional[Dict[str, Any]],
+    chart_type: str = "bar",
+    style_hint: Optional[Dict[str, Any]] = None,
+    preprocess_info: Optional[Dict[str, Any]] = None,
+) -> Iterator[str]:
+    """流式生成图表：逐 token 产出 content 文本。
+
+    前端消费完所有 chunk 后，再在自己那侧做 JSON 解析（或再调一次非流式）。
+    """
+    wrapper = get_llm_wrapper(cfg)
+
+    # 组装用户输入
+    knowledge = get_knowledge_for_type(chart_type)
+    user_prompt = build_chart_user_prompt(
+        prompt=prompt,
+        data=data,
+        chart_type=chart_type,
+        style_hint=style_hint,
+        knowledge=knowledge,
+        preprocess_info=preprocess_info,
     )
 
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": _build_system_prompt(cfg)},
         {"role": "user", "content": user_prompt},
     ]
 
-    return wrapper.call_llm_stream(
+    for chunk in wrapper.call_llm_stream(
         messages=messages,
         max_tokens=cfg.get("max_tokens", 2048),
         temperature=cfg.get("temperature", 0.7),
-        response_format=CHART_RESPONSE_SCHEMA,
-        reasoning_effort=cfg.get("reasoning_effort"),
-    )
+        reasoning_effort=cfg.get("llm_thinking"),
+    ):
+        if chunk:
+            yield chunk

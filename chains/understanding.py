@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""数据理解与整理的 LCEL Chain。"""
-from typing import Any, Dict, Optional
+"""数据理解与整理的 LCEL Chain（Pydantic 结构化输出版）。
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
+用 ``chains.base.StructuredLLMChain`` 装配声明式的 ``prompt | llm | pydantic`` 链；
+用 ``output_parsers.schema.DataUnderstandingResponse`` 保证输出类型安全。
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List, Optional
 
 from llm_client import get_llm_wrapper, compute_column_stats
 from prompts.data_understanding import (
@@ -12,80 +16,60 @@ from prompts.data_understanding import (
     USER_PROMPT_TEMPLATE,
     format_data_understanding_input,
 )
-from output_parsers.chart_parser import parse_data_understanding_response
+from output_parsers.schema import ColumnSchema, DataUnderstandingResponse
+from chains.base import StructuredLLMChain, build_llm
 
 
-def build_data_understanding_chain(cfg: Dict[str, Any]):
-    """构建数据理解与整理的 LCEL 链。
+# ========================================================================
+# 输入格式化
+# ========================================================================
 
-    Args:
-        cfg: LLM 配置字典，包含 base_url, api_key, model 等
+def _format_input_for_llm(
+    cols: List[str],
+    rows: List[Dict[str, Any]],
+    user_hint: str = "",
+    raw_text: str = "",
+) -> str:
+    """把代码解析结果 + 用户提示格式化成给 LLM 的 user prompt 文本。
 
-    Returns:
-        一个 Runnable 对象，输入数据理解参数，输出整理后的数据
+    复用 :func:`prompts.data_understanding.format_data_understanding_input` 得到
+    template 变量 dict，再手工填充 ``USER_PROMPT_TEMPLATE``。
     """
-    wrapper = get_llm_wrapper(cfg)
+    # 先用 format_data_understanding_input 得到 template 变量 dict
+    data = format_data_understanding_input({
+        "cols": cols,
+        "rows": rows,
+        "hint": user_hint,
+        "raw": raw_text,
+    })
 
-    def format_input(inputs: dict) -> dict:
-        """格式化输入参数。"""
-        import json
-        cols = inputs.get("cols", [])
-        if isinstance(cols, list):
-            cols_line = ", ".join(str(c) for c in cols)
-        else:
-            cols_line = str(cols)
+    return USER_PROMPT_TEMPLATE.format(**data)
 
-        rows = inputs.get("rows", [])
-        sample_rows = rows[:8]
-        sample_text = json.dumps(sample_rows, ensure_ascii=False, indent=2) if sample_rows else "(无)"
 
-        col_names = cols if isinstance(cols, list) else [cols]
-        stats_text = compute_column_stats(rows, col_names) if rows else ""
+# ========================================================================
+# Chain 构造
+# ========================================================================
 
-        return {
-            "hint": inputs.get("hint", ""),
-            "cols": cols_line,
-            "count": len(rows),
-            "sample_n": len(sample_rows),
-            "sample": sample_text,
-            "stats": stats_text or "（样本太小，无需统计）",
-            "raw_chars": inputs.get("raw_chars", 6000),
-            "raw": (inputs.get("raw") or "").strip()[:6000] if inputs.get("raw") else "(无)",
-        }
+def build_data_understanding_chain(cfg: Dict[str, Any]) -> StructuredLLMChain:
+    """构建数据理解与整理的 Chain。
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human", USER_PROMPT_TEMPLATE),
-    ])
+    内部使用 :class:`StructuredLLMChain`：
 
-    def parse_output(raw_output: str) -> dict:
-        """解析 LLM 输出。"""
-        obj, err = parse_data_understanding_response(raw_output)
-        if err:
-            return {
-                "success": False,
-                "error": err,
-                "raw_reply": raw_output,
-            }
-        return {
-            "success": True,
-            "columns": obj.get("columns", []),
-            "rows": obj.get("rows", []),
-            "summary": obj.get("summary", ""),
-            "notes": obj.get("notes", ""),
-            "raw_reply": raw_output,
-        }
-
-    chain = (
-        RunnableLambda(format_input)
-        | prompt
-        | wrapper.llm
-        | StrOutputParser()
-        | RunnableLambda(parse_output)
+    - system prompt 使用 :data:`prompts.data_understanding.SYSTEM_PROMPT`
+    - 输出模型绑定到 :class:`output_parsers.schema.DataUnderstandingResponse`
+    - 先尝试 ``ChatOpenAI.with_structured_output(DataUnderstandingResponse)``，
+      失败时降级到手写解析
+    """
+    return StructuredLLMChain(
+        cfg=cfg,
+        system_prompt=SYSTEM_PROMPT,
+        output_model=DataUnderstandingResponse,
     )
 
-    return chain
 
+# ========================================================================
+# 便捷调用
+# ========================================================================
 
 def invoke_data_understanding(
     cfg: Dict[str, Any],
@@ -97,43 +81,76 @@ def invoke_data_understanding(
 
     Args:
         cfg: LLM 配置
-        parsed: 代码解析后的数据
-        user_hint: 用户提示
-        raw_preview: 原始数据预览
+        parsed: 代码解析后的数据（包含 ``columns`` / ``rows``）
+        user_hint: 用户额外提示
+        raw_preview: 原始数据预览（用于 LLM 二次理解）
 
     Returns:
-        整理后的数据字典
+        与旧接口兼容的 dict：``{columns, column_names, rows, count,
+        summary, notes, understand_method, understand_error, raw_reply?}``
     """
-    chain = build_data_understanding_chain(cfg)
-
-    cols = parsed.get("columns", [])
-    rows = parsed.get("rows", [])
-
-    input_data = {
-        "cols": cols,
-        "rows": rows,
-        "hint": user_hint,
-        "raw": raw_preview,
-    }
-
-    result = chain.invoke(input_data)
-
-    if result.get("success"):
-        return {
-            "columns": result["columns"],
-            "column_names": [c["name"] for c in result["columns"]],
-            "rows": result["rows"],
-            "count": len(result["rows"]),
-            "summary": result.get("summary", ""),
-            "notes": result.get("notes", ""),
-            "understand_method": "llm",
-            "understand_error": None,
-            "raw_reply": result.get("raw_reply", ""),
-        }
+    # 1) 准备输入
+    cols_raw = parsed.get("columns") or []
+    if isinstance(cols_raw, list) and cols_raw and isinstance(cols_raw[0], dict):
+        # LLM 整理后的 columns：[{name, type, role, description}, ...]
+        col_names = [c.get("name") for c in cols_raw]
     else:
-        # Fallback to original parsed data
+        # 代码解析的 columns：["col1", "col2", ...]
+        col_names = [str(c) for c in cols_raw]
+
+    rows = parsed.get("rows") or []
+    user_text = _format_input_for_llm(col_names, rows, user_hint, raw_preview)
+
+    # 2) 调用 Chain
+    chain = build_data_understanding_chain(cfg)
+    try:
+        result = chain.invoke(user_text)
+    except Exception as exc:
+        # LLM 调不通 → 直接 fallback
         return {
             **parsed,
             "understand_method": "fallback",
-            "understand_error": result.get("error", "unknown"),
+            "understand_error": f"llm_error: {exc}",
         }
+
+    # 3) 解析结果
+    if isinstance(result, DataUnderstandingResponse):
+        # Pydantic 模型直接使用
+        columns_dicts = [c.model_dump() for c in result.columns]
+        return {
+            "columns": columns_dicts,
+            "column_names": [c["name"] for c in columns_dicts],
+            "rows": result.rows,
+            "count": len(result.rows),
+            "summary": result.summary or "",
+            "notes": result.notes or "",
+            "understand_method": "llm",
+            "understand_error": None,
+        }
+
+    # 非 Pydantic（字符串/其它）时，降级到旧接口格式
+    if isinstance(result, dict):
+        columns = result.get("columns", [])
+        if columns and isinstance(columns[0], dict):
+            col_names_out = [c.get("name") for c in columns]
+        else:
+            col_names_out = [str(c) for c in columns]
+        return {
+            "columns": columns,
+            "column_names": col_names_out,
+            "rows": result.get("rows", rows),
+            "count": len(result.get("rows", rows)),
+            "summary": result.get("summary", ""),
+            "notes": result.get("notes", ""),
+            "understand_method": "llm" if result.get("success", True) else "fallback",
+            "understand_error": None if result.get("success", True) else result.get("error"),
+            "raw_reply": result.get("raw_reply", ""),
+        }
+
+    # 最差 fallback：字符串内容，直接复用原始解析
+    return {
+        **parsed,
+        "understand_method": "fallback",
+        "understand_error": "unexpected_output_type",
+        "raw_reply": str(result)[:2000] if isinstance(result, str) else repr(result)[:2000],
+    }

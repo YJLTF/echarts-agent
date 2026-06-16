@@ -15,15 +15,52 @@ from typing import Any, Dict, Iterator, List, Optional, Union
 
 from langchain_openai import ChatOpenAI
 
-# ------------------------- Provider 检测 -------------------------
+try:
+    from output_parsers.schema import ProviderConfig
+    _HAS_PYDANTIC = True
+except Exception:
+    _HAS_PYDANTIC = False
 
-def _detect_provider(base_url: str) -> str:
-    """从 Base URL 嗅探 provider，用于调整 thinking 字段语义。
+# ------------------------- Provider 检测（向后兼容） -------------------------
+
+
+def get_provider_config(base_url: str, provider: Optional[str] = None) -> "ProviderConfig":
+    """根据 Base URL 返回 Provider 策略配置对象。
+
+    返回值包含 ``thinking_field`` / ``thinking_disabled_value`` / ``thinking_effort_values``
+    三个属性，统一描述该 provider 的 thinking 字段如何映射。
+
+    嗅探规则：
 
     - 命中 ``:11434``（Ollama 默认端口）或路径里含 ``/ollama`` → ``"ollama"``
     - 命中 ``bigmodel.cn`` / ``zhipu`` / ``zhipuai`` → ``"glm"``（智谱 GLM-4.5+）
     - 其它 → ``"openai"``（含 OpenAI / DeepSeek / DashScope 等 OpenAI 兼容服务）
     """
+    u = (base_url or "").lower()
+    name = provider or "openai"
+    if provider is None:
+        if ":11434" in u or "/ollama" in u:
+            name = "ollama"
+        elif "bigmodel.cn" in u or "zhipuai" in u or "zhipu" in u:
+            name = "glm"
+        else:
+            name = "openai"
+    if _HAS_PYDANTIC:
+        return ProviderConfig.for_provider(name)
+    # Pydantic 不可用时，返回一个兼容的命名 tuple
+    _DummyProvider = type("ProviderConfig", (), {"name": name})
+    return _DummyProvider()
+
+
+def _detect_provider(base_url: str) -> str:
+    """与旧接口兼容：返回 provider 名字符串。
+
+    新代码请使用 :func:`get_provider_config` 返回带策略的 ``ProviderConfig``。
+    """
+    return get_provider_config(base_url).name if _HAS_PYDANTIC else _legacy_detect(base_url)
+
+
+def _legacy_detect(base_url: str) -> str:
     u = (base_url or "").lower()
     if ":11434" in u or "/ollama" in u:
         return "ollama"
@@ -32,34 +69,30 @@ def _detect_provider(base_url: str) -> str:
     return "openai"
 
 
-def _resolve_thinking_field(
-    cfg: Dict[str, Any],
-    user_value: Optional[str],
-) -> Optional[tuple[str, Any]]:
-    """把 DB 里的 ``llm_thinking`` 按 provider 转成 ``(field, value)``，无则返回 ``None``。
+def resolve_extra_kwargs(base_url: str, user_value: Optional[str], provider: Optional[str] = None) -> Dict[str, Any]:
+    """把用户输入的 ``llm_thinking`` 值解析成传给 LLM 的 extra kwargs。
 
-    Provider 差异：
-    - **openai**（含 DeepSeek / DashScope / Qwen 等 OpenAI 兼容）：``off`` → 不发送；
-      ``low``/``medium``/``high`` → 透传 ``reasoning_effort``
-    - **ollama**：``off`` → 发 ``reasoning_effort: "none"`` 显式关闭（Ollama 缺省≠关闭）；
-      其它值 → 透传
-    - **glm**（智谱 GLM-4.5+）：用 ``thinking: {type: "enabled" | "disabled"}`` 对象；
-      ``off`` → ``{type: "disabled"}``；其它值（low/medium/high）→ ``{type: "enabled"}``（GLM 无粒度，统一开启）
-    - 非法值 → ``None``
+    基于 ``ProviderConfig`` 的策略配置返回 ``{"reasoning_effort": ...}`` 或 ``{"thinking": ...}``。
     """
+    if not _HAS_PYDANTIC:
+        # 降级：手写的旧逻辑
+        return _legacy_resolve_extra(base_url, user_value, provider)
+    config = get_provider_config(base_url, provider)
+    return config.resolve_extra(user_value)
+
+
+def _legacy_resolve_extra(base_url: str, user_value: Optional[str], provider: Optional[str] = None) -> Dict[str, Any]:
+    p = (provider or _legacy_detect(base_url)).lower()
     v = (user_value or "").strip().lower()
-    provider = (cfg.get("provider") or _detect_provider(cfg.get("base_url", ""))).lower()
     if v in ("", "off"):
-        if provider == "ollama":
-            return ("reasoning_effort", "none")
-        if provider == "glm":
-            return ("thinking", {"type": "disabled"})
-        return None
-    if v in ("low", "medium", "high"):
-        if provider == "glm":
-            return ("thinking", {"type": "enabled"})
-        return ("reasoning_effort", v)
-    return None
+        if p == "ollama":
+            return {"reasoning_effort": "none"}
+        if p == "glm":
+            return {"thinking": {"type": "disabled"}}
+        return {}
+    if p == "glm":
+        return {"thinking": {"type": "enabled"}}
+    return {"reasoning_effort": v if v in ("low", "medium", "high") else "medium"}
 
 
 # ------------------------- LangChain ChatOpenAI 封装 -------------------------
@@ -128,10 +161,9 @@ class ChatOpenAIWrapper:
             payload["max_tokens"] = max_tokens
         if response_format is not None:
             payload["response_format"] = response_format
-        thinking = _resolve_thinking_field({"provider": self.provider}, reasoning_effort)
-        if thinking is not None:
-            field, value = thinking
-            payload[field] = value
+        thinking = resolve_extra_kwargs(self.base_url, reasoning_effort, self.provider)
+        if thinking:
+            payload.update(thinking)
         if stream:
             payload["stream"] = True
         return payload
@@ -168,13 +200,9 @@ class ChatOpenAIWrapper:
         temp = temperature if temperature is not None else self.temperature
 
         # 构建 extra_body
-        extra_body: Dict[str, Any] = {}
-        thinking = _resolve_thinking_field(
-            {"provider": self.provider}, reasoning_effort or self.reasoning_effort
+        extra_body: Dict[str, Any] = resolve_extra_kwargs(
+            self.base_url, reasoning_effort or self.reasoning_effort, self.provider
         )
-        if thinking is not None:
-            field, value = thinking
-            extra_body[field] = value
 
         # 构建 chat messages
         from langchain_core.messages import HumanMessage, SystemMessage
