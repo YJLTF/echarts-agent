@@ -264,6 +264,11 @@ textarea:focus, input:focus, select:focus {
   border-color: #ffe7ba;
   color: #ad6800;
 }
+.understand-tag.warn {
+  background: #fff1f0;
+  border-color: #ffccc7;
+  color: #a82a2a;
+}
 
 .hint {
   padding: 8px 10px;
@@ -340,12 +345,12 @@ textarea:focus, input:focus, select:focus {
   padding: 18px 24px 0 24px;
 }
 .chart {
-  height: clamp(380px, 58vh, 620px);
+  height: clamp(380px, 58vh, 640px);
   background: var(--panel);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   padding: 6px;
-  max-width: 1400px;
+  max-width: 1600px;
   margin: 0 auto;
 }
 
@@ -399,11 +404,19 @@ textarea:focus, input:focus, select:focus {
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   min-height: 180px;
-  max-height: min(540px, calc(100vh - 560px));
+  /* 大屏下让面板吃满剩余空间（与图表等高），小屏用 max-height 兜底 */
+  flex: 1 1 320px;
+  max-height: min(560px, calc(100vh - 520px));
   overflow: auto;
+  position: relative;
 }
-.tab-panel {
+/* 每个 wrap 是相对定位容器，承载「复制」按钮 + pre */
+.tab-panel-wrap {
   display: none;
+  position: relative;
+}
+.tab-panel-wrap.active { display: block; }
+.tab-panel {
   padding: 14px 16px;
   margin: 0;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -412,7 +425,26 @@ textarea:focus, input:focus, select:focus {
   white-space: pre-wrap;
   word-break: break-word;
 }
-.tab-panel.active { display: block; }
+/* 复制按钮：浮在右上角，只在 wrap 显示时露出 */
+.tab-copy {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 2;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--code-text);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s, background .15s;
+}
+.tab-panel-wrap:hover .tab-copy,
+.tab-copy:focus-visible { opacity: 1; }
+.tab-copy:hover { background: rgba(255, 255, 255, 0.18); }
+.tab-copy.copied { background: var(--accent); color: #0f172a; border-color: transparent; opacity: 1; }
 
 /* ------ Form group (used by config modal) ------ */
 .form-group {

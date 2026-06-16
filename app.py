@@ -4,7 +4,6 @@ import json
 import os
 import re
 import sqlite3
-import uuid
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Optional
@@ -12,15 +11,16 @@ from typing import Optional
 from flask import (
     Flask,
     Response,
+    abort,
     jsonify,
     render_template,
     request,
-    send_from_directory,
 )
 from flask_cors import CORS
 from werkzeug.datastructures import FileStorage
 
-from llm_client import call_llm, call_llm_stream, build_chart_prompt, pick_chart_type
+from llm_client import call_llm, call_llm_stream, call_llm_raw, build_chart_prompt, pick_chart_type
+import llm_client
 from data_parser import parse_upload, parse_data_text, list_excel_sheets
 from data_understanding import understand_data
 from data_preprocessing import preprocess_data
@@ -147,44 +147,202 @@ def _get_param(name: str):
 
 _DEFAULT_SYSTEM_PROMPT = """你是一名资深的 Apache ECharts 图表工程师，擅长把数据快速转化成生产级 ECharts option。
 
-【硬约束】
-1) 只输出一个 JSON 对象，用 ```json ... ``` 包裹；JSON 内不要写注释、不要 markdown 链接。
+【硬约束 — 不可违反】
+0) **回复首字符必须是 `{`，末字符必须是 `}`，整篇回复只包含一个 JSON 对象**。**严禁**使用 Markdown 代码块、严禁写任何前后缀文字、严禁重复输出多个对象。
+1) 严格按 response_format 给定的 JSON schema 输出。
 2) 严格使用用户给的数据，不编造、不替换；xAxis/yAxis 的 data 与列名一致；数值不要用字符串。
 3) 数值轴用 type:'value'；类别轴 type:'category' 并提供 data 数组；时间轴 type:'time'。
 4) 配色统一用 ECharts 默认调色板（#5470c6 #91cc75 #ee6666 #73a0fa #fac858 #3ba272 等）；用户没指定时不要硬编色名。
 5) 标题/副标题/网格/tooltip/legend 按需配置；不输出你无法控制的字段（CDN URL、外部图片、_placeholder 之类）。
-6) JSON 之后用 30-80 字中文简要说明该图表达的核心信息（最大/最小/趋势/对比），不要复述数据。
-7) 【禁止 JS 函数】option 中**禁止**出现 `function (...) {…}` / `() => {…}` 等函数字面量（JSON 不支持函数，会导致解析失败）：
+6) 【禁止 JS 函数】option 中**禁止**出现 `function (...) {…}` / `() => {…}` 等函数字面量（JSON 不支持函数，会导致解析失败）：
    - 自定义 tooltip / label / axisLabel 文案 → 用字符串模板，如 `'{b}: {c}'`、`'{a} <br/>{b}: {c}'`、`'{b} ({c}%)'`
    - 自定义节点 / 系列配色 → 用 series 顶层 `color: [...]` 数组（让 ECharts 循环取色），或省略该字段使用默认色
    - 字符串模板占位符：`{a}` 系列名 / `{b}` 类目名或数据名 / `{c}` 数值 / `{d}` 饼图百分比 / `{@xxx}` 指定维度值
+7) content 字段填 30-80 字中文文字解释该图表表达的核心信息（最大/最小/趋势/对比），不要复述数据。
 
-【最小可用结构（bar / line 参考）】
-```json
+【最小可用结构 —— 必须严格按此形状输出，option 里只能放 ECharts 字段，绝对不要把 "content" 写进 option】
 {
-  "title": {"text": "某月销售额"},
-  "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-  "grid": {"left": 40, "right": 20, "top": 30, "bottom": 30, "containLabel": true},
-  "xAxis": {"type": "category", "data": ["1月", "2月", "3月"]},
-  "yAxis": {"type": "value"},
-  "series": [
-    {"name": "销售额", "type": "bar", "data": [120, 132, 101], "itemStyle": {"borderRadius": [4, 4, 0, 0]}}
-  ]
+  "option": {
+    "title": {"text": "某月销售额"},
+    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+    "grid": {"left": 40, "right": 20, "top": 30, "bottom": 30, "containLabel": true},
+    "xAxis": {"type": "category", "data": ["1月", "2月", "3月"]},
+    "yAxis": {"type": "value"},
+    "series": [
+      {"name": "销售额", "type": "bar", "data": [120, 132, 101], "itemStyle": {"borderRadius": [4, 4, 0, 0]}}
+    ]
+  },
+  "content": "3月销售额最低 101，2月最高 132，整体在 100-140 之间波动。"
 }
-```
 
 用户给的需求、数据统计摘要、图表类型专属 KB 都在下方用户消息里，按它们生成。"""
 
 
+# 主生成阶段的结构化输出 schema。
+# - option：ECharts option 整体是结构自由的（字段 200+），用 additionalProperties: true 兜住；
+#   真正能强约束的是 content 字段。
+# - content：30-80 字中文文字解释。
+# OpenAI 严格模式要求 additionalProperties 在 schema 中显式声明，因此顶层和 option 都要写。
+_CHART_RESPONSE_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "echarts_chart_response",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "option": {
+                    "type": "object",
+                    "description": "完整的 Apache ECharts option 配置对象。",
+                    "additionalProperties": True,
+                },
+                "content": {
+                    "type": "string",
+                    "description": "30-80 字中文文字解释该图表表达的核心信息。",
+                    "minLength": 1,
+                },
+            },
+            "required": ["option", "content"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+_RE_JSON_FENCE = re.compile(
+    r"```(?:json|javascript|js|echarts)?\s*(\{[\s\S]+?\})\s*```", re.IGNORECASE
+)
+
+
+def _strip_json_fence(raw: str) -> tuple[Optional[str], str]:
+    """从 raw 中抠出 ```json...``` 围栏内的 JSON 切片 + 围栏外的剩余文字。
+
+    Returns:
+        (json_inside, text_outside)
+        - 找不到围栏：返回 (None, raw)
+        - 找到：返回 (围栏内 JSON 字符串, 围栏外剩余文字 trim 后)
+    """
+    m = _RE_JSON_FENCE.search(raw)
+    if not m:
+        return None, raw
+    inside = m.group(1)
+    # 围栏外：raw 里 m.start() 之前 + m.end() 之后
+    outside = (raw[: m.start()] + raw[m.end() :]).strip()
+    return inside, outside
+
+
+def _parse_structured_chart(raw: str) -> tuple[Optional[dict], Optional[str], Optional[str], str]:
+    """从 LLM 单次返回里直接抠出 (option, content, method, error)。
+
+    主路径：上游 ``response_format=json_schema/json_object`` 强制单层 JSON → ``json.loads`` 一次即得。
+    兜底：极少数 LLM/网关不响应 response_format、模型继续用 `` ```json...``` `` 围栏 + 围栏外文字
+    —— 这种情况下也认：扫到围栏就 strip，里面若已是 {option, content} 直接用；
+    若只是 ECharts option（series/title/...），就把它当 option，围栏外文字当 content。
+
+    Returns:
+        (option, content, method, error)
+        - 成功：error 为 ``""``
+        - 失败：option / content / method 为 ``None``，error 描述问题
+        - method 取值：``"primary"`` / ``"in_option"`` / ``"fence_fence_full"`` /
+          ``"fence_fence_option"`` / ``"fence_fence_in_option"``，前端用来显示"LLM 偏离"徽章
+    """
+    if not raw or not raw.strip():
+        return None, None, None, "LLM 返回为空"
+
+    # 把 ``<think>...</think>`` 块（Ollama / OpenAI 推理模式 + 我们的拼接）从头部剥掉，
+    # 不让它的内容干扰 JSON 解析
+    raw = re.sub(r"<think>[\s\S]*?</think>", "", raw).strip()
+
+    def _validate(obj) -> tuple[Optional[dict], Optional[str]]:
+        """校验 {option: dict, content: str} 结构。返回 (option, content) 或 (None, None)。"""
+        if not isinstance(obj, dict):
+            return None, None
+        option = obj.get("option")
+        content = obj.get("content")
+        if isinstance(option, dict) and isinstance(content, str):
+            return option, content
+        return None, None
+
+    def _is_echarts_option_shape(obj) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        return any(k in obj for k in ("series", "title", "xAxis", "yAxis", "legend", "tooltip"))
+
+    def _extract_option_and_content(obj: dict) -> tuple[Optional[dict], Optional[str], bool]:
+        """从「裸 ECharts option」里识别/抽离出 content 字段。返回 (option, content, popped)。"""
+        if not _is_echarts_option_shape(obj):
+            return obj, "", False
+        content_val = obj.get("content")
+        if isinstance(content_val, str) and content_val.strip():
+            new_option = {k: v for k, v in obj.items() if k != "content"}
+            return new_option, content_val, True
+        return obj, "", False
+
+    # 1) 主路径：直接 json.loads
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        obj = None
+    if obj is not None:
+        got = _validate(obj)
+        if got[0] is not None and got[1] is not None:
+            return got[0], got[1], "primary", ""
+        # 顶层是合法 JSON 但 schema 不匹配 —— 看看是不是 ECharts option 裸对象
+        if _is_echarts_option_shape(obj):
+            opt2, cnt2, popped = _extract_option_and_content(obj)
+            return opt2, cnt2, ("in_option" if popped else "primary_bare"), ""
+
+    # 2) 兜底：strip ```json...``` 围栏
+    inside, outside = _strip_json_fence(raw)
+    if inside:
+        try:
+            inner_obj = json.loads(inside)
+        except Exception:
+            inner_obj = None
+        if isinstance(inner_obj, dict):
+            got = _validate(inner_obj)
+            if got[0] is not None and got[1] is not None:
+                return got[0], got[1], "fence_full", ""
+            # 围栏里只是 ECharts option（没有 option/content 包装）→ 整段当 option，
+            # 围栏外文字当 content
+            if _is_echarts_option_shape(inner_obj):
+                opt2, cnt2, popped = _extract_option_and_content(inner_obj)
+                # 围栏外文字作为优先 content（LLM 老格式：option 在围栏里，解释在围栏外）
+                if outside.strip():
+                    return opt2, outside, "fence_option", ""
+                return opt2, cnt2, ("fence_in_option" if popped else "fence_option"), ""
+
+    preview = raw.strip().replace("\n", " ")[:160]
+    return None, None, None, f"模型输出不符合结构化 schema：JSON.loads 失败或字段缺失（reply: {preview!r}）"
+
+
+# 推理深度合法取值。空串 / off / low / medium / high —— "off" 与空串都视为"不发送"。
+_LLM_THINKING_ALLOWED = {"", "off", "low", "medium", "high"}
+
+
+def _normalize_thinking(v: object) -> str:
+    """把用户/DB 里的 llm_thinking 值归一化成合法取值。"""
+    s = str(v or "").strip().lower()
+    return s if s in _LLM_THINKING_ALLOWED else ""
+
+
 def build_llm_cfg() -> dict:
     cfg = get_all_config()
+    thinking = _normalize_thinking(cfg.get("llm_thinking"))
+    base_url = cfg.get("llm_base_url", "").strip().rstrip("/")
     return {
-        "base_url": cfg.get("llm_base_url", "").strip().rstrip("/"),
+        "base_url": base_url,
         "api_key": cfg.get("llm_api_key", "").strip(),
         "model": cfg.get("llm_model", "").strip(),
         "system_prompt": cfg.get("system_prompt", "").strip(),
         "temperature": float(cfg.get("llm_temperature") or 0.7),
         "max_tokens": int(cfg.get("llm_max_tokens") or 2048),
+        # 推理深度："" / "off" 不发送；"low"/"medium"/"high" 透传给服务端
+        # —— 实际是否会发送还看 provider（Ollama 下 ""→"none" 显式关闭）
+        "reasoning_effort": "" if thinking in ("", "off") else thinking,
+        # Provider 嗅探：Ollama 的 reasoning_effort 语义与 OpenAI 略有差异
+        # —— "off" 在 Ollama 上要发 "none" 才会真正关闭思考
+        "provider": llm_client._detect_provider(base_url),
     }
 
 
@@ -231,6 +389,7 @@ def api_config_set():
         "system_prompt",
         "llm_temperature",
         "llm_max_tokens",
+        "llm_thinking",
     ):
         if k not in data or data[k] is None:
             continue
@@ -239,6 +398,9 @@ def api_config_set():
             if not isinstance(v, str) or not v.strip():
                 continue
             v = v.strip()
+        elif k == "llm_thinking":
+            # 推理深度：必须落在白名单里；非法值原样存（前端下拉会兜底）
+            v = str(v).strip()
         set_config(k, str(v))
     return jsonify({"ok": True, "saved_keys": list(data.keys())})
 
@@ -270,6 +432,8 @@ def api_config_test():
             cfg["max_tokens"] = int(body["llm_max_tokens"])
         except (TypeError, ValueError):
             pass
+    if "llm_thinking" in body and body["llm_thinking"] is not None:
+        cfg["reasoning_effort"] = "" if _normalize_thinking(body["llm_thinking"]) in ("", "off") else _normalize_thinking(body["llm_thinking"])
 
     if not cfg["api_key"]:
         return jsonify({"ok": False, "message": "未填写 API Key（请在表单填入或先保存一次）"}), 400
@@ -381,17 +545,9 @@ def api_knowledge():
 @config_required
 def api_chart():
     """非流式 JSON 接口（保留旧行为）：走完整 pipeline，但只返回最终结果。"""
-    body = request.get_json(force=True) or {}
-    prompt = (body.get("prompt") or "").strip()
-    data = body.get("data")
-    chart_type_hint = body.get("chart_type_hint") or ""
-    style_hint = body.get("style_hint") or {}
-
-    if not prompt and not data:
-        return jsonify({"error": "请至少输入需求或提供数据。"}), 400
+    prompt, data, chart_type_hint, style_hint = _parse_chart_request()
 
     cfg = build_llm_cfg()
-
     final = None
     error_payload = None
     for evt in run_chart_pipeline(cfg, prompt, data, chart_type_hint, style_hint, stream=False):
@@ -415,6 +571,21 @@ def api_chart():
     return jsonify(final)
 
 
+def _parse_chart_request() -> tuple[str, object, str, dict]:
+    """从 request body 抽出 ``(prompt, data, chart_type_hint, style_hint)``。
+
+    无 prompt / 无 data 时直接 400 中断（通过 ``abort``）。
+    """
+    body = request.get_json(force=True) or {}
+    prompt = (body.get("prompt") or "").strip()
+    data = body.get("data")
+    chart_type_hint = (body.get("chart_type_hint") or "").strip()
+    style_hint = body.get("style_hint") or {}
+    if not prompt and not data:
+        abort(400, description="请至少输入需求或提供数据。")
+    return prompt, data, chart_type_hint, style_hint
+
+
 @app.route("/api/chart/stream", methods=["POST"])
 @config_required
 def api_chart_stream():
@@ -430,27 +601,17 @@ def api_chart_stream():
 
         data: {"type":"error", "message":"..."}\\n\\n
     """
-    body = request.get_json(force=True) or {}
-    prompt = (body.get("prompt") or "").strip()
-    data = body.get("data")
-    chart_type_hint = body.get("chart_type_hint") or ""
-    style_hint = body.get("style_hint") or {}
-
-    if not prompt and not data:
-        return jsonify({"error": "请至少输入需求或提供数据。"}), 400
+    prompt, data, chart_type_hint, style_hint = _parse_chart_request()
 
     cfg = build_llm_cfg()
-
-    def _sse_format(obj: dict) -> str:
-        return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
     def generate():
         try:
             for evt in run_chart_pipeline(cfg, prompt, data, chart_type_hint, style_hint, stream=True):
-                yield _sse_format(evt)
+                yield _sse_format_event(evt)
         except Exception as e:
             # 兜底：pipeline 自己已经在出错位置 emit 过 error；这里再补一发以防外层异常
-            yield _sse_format({"type": "error", "message": f"生成失败：{e}"})
+            yield _sse_format_event({"type": "error", "message": f"生成失败：{e}"})
 
     return Response(
         generate(),
@@ -461,6 +622,11 @@ def api_chart_stream():
             "Connection": "keep-alive",
         },
     )
+
+
+def _sse_format_event(obj: dict) -> str:
+    """把一个事件 dict 格式化为 SSE 单行：``data: {json}\\n\\n``。"""
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
 
 # ---------------------- Chart Generation Pipeline ----------------------
@@ -643,17 +809,26 @@ def run_chart_pipeline(
                 messages=messages,
                 max_tokens=cfg["max_tokens"],
                 temperature=cfg["temperature"],
+                response_format=_CHART_RESPONSE_SCHEMA,
+                reasoning_effort=cfg.get("reasoning_effort") or None,
             ):
                 raw += chunk
                 if chunk:
                     yield {"type": "delta", "content": chunk}
+            # 流式拿不到 reasoning 字段（增量 chunk 里 reasoning 不被解析），置空
+            reasoning = ""
         else:
-            raw = call_llm(
+            raw, reasoning = call_llm_raw(
                 cfg,
                 messages=messages,
                 max_tokens=cfg["max_tokens"],
                 temperature=cfg["temperature"],
+                response_format=_CHART_RESPONSE_SCHEMA,
+                reasoning_effort=cfg.get("reasoning_effort") or None,
             )
+            # 把 reasoning 拼到 raw_reply 头部，让用户能在「原始回复」tab 看到思考过程
+            if reasoning:
+                raw = f"<think>\n{reasoning}\n</think>\n\n{raw}"
     except Exception as e:
         yield {
             "type": "stage",
@@ -665,42 +840,26 @@ def run_chart_pipeline(
         return
     yield {"type": "stage", "stage": "generate", "status": "done", "length": len(raw)}
 
-    # ---- 7) 解析 + 自动重试 ----
+    # ---- 7) 解析（结构化输出 → 一次 json.loads 即够） ----
     yield {"type": "stage", "stage": "parse", "label": "解析与校验", "status": "start"}
-    parsed = extract_json(raw)
-    retried = False
-    if parsed is None:
-        # 一次自动重试
-        yield {"type": "stage", "stage": "parse", "substep": "retry", "status": "start"}
-        retry_outcome = yield from _retry_parse_json(cfg, sys_prompt, raw, stream=stream)
-        # _retry_parse_json 是个生成器，每个元素是事件；最后一次通过 return 传结果
-        new_raw, fixed, error_event = retry_outcome
-        if fixed is not None:
-            raw = new_raw
-            parsed = fixed
-            retried = True
-            yield {"type": "stage", "stage": "parse", "substep": "retry", "status": "done"}
-        else:
-            # 把子生成器最后的错误事件原样转发
-            if error_event is not None:
-                yield error_event
-            else:
-                yield {
-                    "type": "stage",
-                    "stage": "parse",
-                    "status": "error",
-                    "message": "无法从模型回复中解析出 JSON（已尝试自动修正）",
-                }
-                yield {
-                    "type": "error",
-                    "message": "无法从模型回复中解析出 JSON 配置（已尝试一次自动修正，仍未通过）。",
-                    "raw_reply": raw,
-                    "status": 502,
-                }
-            return
-
-    option, code, explanation, fn_map = parsed
-    chart_js = wrap_code(option, code or "", chosen_type, fn_map=fn_map)
+    option, content, parse_method, parse_error = _parse_structured_chart(raw)
+    if parse_error:
+        yield {
+            "type": "stage",
+            "stage": "parse",
+            "status": "error",
+            "message": parse_error,
+        }
+        yield {
+            "type": "error",
+            "message": f"模型输出不符合结构化 schema：{parse_error}",
+            "raw_reply": raw,
+            "status": 502,
+        }
+        return
+    assert option is not None and content is not None
+    code = None
+    chart_js = wrap_code(option, code, chosen_type)
 
     # ---- 8) 保存到默认会话 ----
     chat_id = ensure_default_chat()
@@ -711,7 +870,7 @@ def run_chart_pipeline(
             (
                 chat_id,
                 "assistant",
-                explanation or raw,
+                content or raw,
                 json.dumps(data, ensure_ascii=False) if data else None,
                 json.dumps(option, ensure_ascii=False),
                 chart_js,
@@ -721,96 +880,26 @@ def run_chart_pipeline(
         )
         conn.commit()
 
-    yield {"type": "stage", "stage": "parse", "status": "done", "retried": retried}
+    yield {"type": "stage", "stage": "parse", "status": "done"}
 
     resp = {
         "chart_type": chosen_type,
         "type_reason": type_reason,
         "option": option,
         "code": chart_js,
-        "explanation": explanation,
+        "content": content,
+        # 兼容字段：旧前端 / 旧消息会读 explanation
+        "explanation": content,
         "raw_reply": raw,
-        "retried": retried,
-        "fn_map": fn_map or None,
+        # primary / in_option / fence_full / fence_option / fence_in_option —— 前端用
+        # 来判断是否提示用户「LLM 没按 schema 输出」
+        "parse_method": parse_method or "primary",
     }
     if understanding is not None:
         resp["understanding"] = understanding
     if preprocess_info is not None:
         resp["preprocess"] = preprocess_info
     yield {"type": "done", **resp}
-
-
-def _build_retry_prompt(broken_raw: str) -> str:
-    """构造让 LLM 修正 JSON 输出的 prompt。"""
-    return (
-        "你上一轮的回复无法被解析为合法 JSON（常见原因：漏了闭合括号、"
-        "JSON 末尾多了文本或表格、混入了多余代码块、行尾有未闭合的 // 注释、"
-        "**option 中写了 JS 函数字面量**）。\n"
-        f"你上一轮的原始回复（前 4000 字符）：\n```\n{broken_raw[:4000]}\n```\n\n"
-        "请基于同一份需求重新输出，**严格遵守**：\n"
-        "1) 只输出一个用 ```json ... ``` 包裹的合法 JSON 对象；\n"
-        "2) JSON 内不要写任何注释（// 或 /* */）；\n"
-        "3) 不要输出多余的解释文字、表格或第二个代码块；\n"
-        "4) 确保所有大括号、中括号、双引号都正确闭合；\n"
-        "5) 【关键】option 中**禁止 JS 函数**（`function () {}` / `() => {}`）—— JSON 不支持函数，"
-        "解析必失败：`formatter` 用字符串模板（如 `'{b}: {c}'`），`color` 用 series 顶层 `color: [...]` 数组或省略。"
-    )
-
-
-def _retry_parse_json(cfg: dict, sys_prompt: str, broken_raw: str, *, stream: bool):
-    """让 LLM 重新生成一次，修复坏掉的 JSON 输出。
-
-    同时作为流式事件源：过程中 yield  ``delta`` 事件（如果 stream=True）。
-    最终通过 ``return (new_raw, parsed_or_None, error_event_or_None)`` 一次性把结果传回调用方。
-    """
-    fix_msg = _build_retry_prompt(broken_raw)
-    temperature = max(0.3, cfg.get("temperature") or 0.7)  # 略偏向确定性，便于稳定
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": fix_msg},
-    ]
-    new_raw = ""
-    try:
-        if stream:
-            for chunk in call_llm_stream(
-                cfg,
-                messages=messages,
-                max_tokens=cfg["max_tokens"],
-                temperature=temperature,
-            ):
-                new_raw += chunk
-                if chunk:
-                    yield {"type": "delta", "content": chunk}
-        else:
-            new_raw = call_llm(
-                cfg,
-                messages=messages,
-                max_tokens=cfg["max_tokens"],
-                temperature=temperature,
-            )
-    except Exception as e:
-        err = {
-            "type": "stage",
-            "stage": "parse",
-            "status": "error",
-            "message": str(e),
-        }
-        return (new_raw, None, {
-            "type": "error",
-            "message": f"自动修正失败：{e}",
-            "raw_reply": new_raw,
-            "status": 500,
-        })
-
-    fixed = extract_json(new_raw)
-    if fixed is not None:
-        return (new_raw, fixed, None)
-    return (new_raw, None, {
-        "type": "error",
-        "message": "无法从模型回复中解析出 JSON 配置（已尝试一次自动修正，仍未通过）。",
-        "raw_reply": broken_raw,
-        "status": 502,
-    })
 
 
 # ---------------------- Chat History ----------------------
@@ -844,517 +933,18 @@ def api_chat_messages(chat_id: str):
         return jsonify([dict(r) for r in rows])
 
 
-# ---------------------- Helpers ----------------------
-# JSON 候选最大长度：超过即放弃（防 LLM 异常输出巨大字符串时拖累 json.loads / re.sub）。
-_MAX_JSON_CANDIDATE = 500_000
-# 解释文本截断长度。
-_MAX_EXPLANATION = 1500
 
-# 预编译热路径正则：抓 JSON 代码块、抓 JS/JS/Python 代码块、去所有代码块。
-_RE_JSON_FENCE = re.compile(
-    r"```(?:json|echarts|javascript)?\s*(\{[\s\S]+?\})\s*```", re.IGNORECASE
-)
-_RE_JS_FENCE = re.compile(
-    r"```javascript\s*([\s\S]+?)\s*```", re.IGNORECASE
-)
-_RE_ALT_FENCE = re.compile(
-    r"```(?:js|python)\s*([\s\S]+?)\s*```", re.IGNORECASE
-)
-_RE_ANY_FENCE = re.compile(r"```[\s\S]+?```")
-_RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
-_RE_LINE_COMMENT = re.compile(r"//[^\n]*")
-_RE_BLOCK_COMMENT = re.compile(r"/\*[\s\S]*?\*/")
-
-
-def _scan_json_object(raw: str, max_size: int = _MAX_JSON_CANDIDATE) -> Optional[str]:
-    """扫描 raw 中**第一个完整的顶层 JSON 对象**并返回切片。
-
-    关键改进（相对 ``raw.find("{") + raw.rfind("}")``）：
-    - 用栈式扫描，严格匹配大括号，正确处理字符串字面量与 ``\\"`` 转义；
-    - 找到首个匹配即返回，**不会**把后续解释/噪声一起包进来；
-    - 候选长度超过 ``max_size`` 直接放弃（防退化）。
-    """
-    start = raw.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_str = False
-    escape = False
-    n = len(raw)
-    for i in range(start, n):
-        c = raw[i]
-        if in_str:
-            if escape:
-                escape = False
-            elif c == "\\":
-                escape = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                if end - start > max_size:
-                    return None
-                return raw[start:end]
-    return None
-
-
-def _try_fix_json(text: str) -> str:
-    """对 LLM 输出的「几乎对的 JSON」做最小修复：去行/块注释 + 尾随逗号。
-
-    跳过不可能命中的分支（没 ``//`` / ``/*`` 时不跑注释扫描），避免对大字符串白做工。
-    不做引号替换（容易误伤）；只处理最常见的两类错。
-    """
-    if "//" in text or "/*" in text:
-        text = _RE_LINE_COMMENT.sub("", text)
-        text = _RE_BLOCK_COMMENT.sub("", text)
-    return _RE_TRAILING_COMMA.sub(r"\1", text)
-
-
-# 占位符前缀 + UUID，避免与 option 真实内容冲突；wrap_code 阶段还原成原始 JS 源码。
-_FN_PLACEHOLDER_PREFIX = "__ECHARTS_FN_"
-
-
-def _find_matching_brace(text: str, start: int) -> Optional[int]:
-    """在 text[start] 必须是 ``{`` 的前提下，找到与之配对的 ``}`` 索引。
-
-    正确处理：JSON 双引号字符串、JS 单引号字符串、JS 模板字符串（`` `…${ … }…` `` 内插里的嵌套大括号也平衡）、
-    行/块注释。配对失败（不闭合）返回 ``None``。
-    """
-    if start >= len(text) or text[start] != "{":
-        return None
-    n = len(text)
-    depth = 1
-    i = start + 1
-    in_str = False
-    in_squote = False
-    in_tmpl = False
-    in_line = False
-    in_block = False
-    while i < n:
-        c = text[i]
-        if in_line:
-            if c == "\n":
-                in_line = False
-            i += 1
-            continue
-        if in_block:
-            if c == "*" and i + 1 < n and text[i + 1] == "/":
-                in_block = False
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_str:
-            if c == "\\":
-                i += 2
-                continue
-            if c == '"':
-                in_str = False
-            i += 1
-            continue
-        if in_squote:
-            if c == "\\":
-                i += 2
-                continue
-            if c == "'":
-                in_squote = False
-            i += 1
-            continue
-        if in_tmpl:
-            if c == "\\":
-                i += 2
-                continue
-            if c == "`":
-                in_tmpl = False
-                i += 1
-                continue
-            if c == "$" and i + 1 < n and text[i + 1] == "{":
-                # 模板字符串内插：单独平衡 ${…} 里的花括号
-                i += 2
-                sub_depth = 1
-                sub_in_str = False
-                sub_in_squote = False
-                while i < n and sub_depth > 0:
-                    cc = text[i]
-                    if sub_in_str:
-                        if cc == "\\":
-                            i += 2
-                            continue
-                        if cc == '"':
-                            sub_in_str = False
-                        i += 1
-                        continue
-                    if sub_in_squote:
-                        if cc == "\\":
-                            i += 2
-                            continue
-                        if cc == "'":
-                            sub_in_squote = False
-                        i += 1
-                        continue
-                    if cc == '"':
-                        sub_in_str = True
-                        i += 1
-                        continue
-                    if cc == "'":
-                        sub_in_squote = True
-                        i += 1
-                        continue
-                    if cc == "{":
-                        sub_depth += 1
-                    elif cc == "}":
-                        sub_depth -= 1
-                        if sub_depth == 0:
-                            i += 1
-                            break
-                    i += 1
-                continue
-            i += 1
-            continue
-        # Normal
-        if c == "/" and i + 1 < n:
-            if text[i + 1] == "/":
-                in_line = True
-                i += 2
-                continue
-            if text[i + 1] == "*":
-                in_block = True
-                i += 2
-                continue
-        if c == '"':
-            in_str = True
-            i += 1
-            continue
-        if c == "'":
-            in_squote = True
-            i += 1
-            continue
-        if c == "`":
-            in_tmpl = True
-            i += 1
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    return None
-
-
-def _strip_js_functions(candidate: str) -> tuple:
-    """从 JSON 风格文本里抠出 ``function (...) {…}`` 字面量，换成唯一占位符字符串。
-
-    LLM 生成的 ECharts option 常带 ``tooltip.formatter`` / ``itemStyle.color`` 等
-    JS 函数 —— 这些**不是合法 JSON**，``json.loads`` 直接挂。本函数把函数字面量
-    整段换成 ``"__ECHARTS_FN_<uuid>__"``（带引号，作为合法 JSON 字符串），
-    让 ``json.loads`` 通过；前端拿到 ``fn_map`` 后再把占位符还原成真函数。
-
-    Returns:
-        (cleaned_candidate, {placeholder: original_fn_text})
-    """
-    n = len(candidate)
-    out_parts: list = []
-    fn_map: dict = {}
-    i = 0
-    last = 0
-
-    in_str = False
-    in_squote = False
-    in_tmpl = False
-    in_line = False
-    in_block = False
-
-    def is_word(c: str) -> bool:
-        return c.isalnum() or c == "_" or c == "$"
-
-    while i < n:
-        c = candidate[i]
-        if in_line:
-            if c == "\n":
-                in_line = False
-            i += 1
-            continue
-        if in_block:
-            if c == "*" and i + 1 < n and candidate[i + 1] == "/":
-                in_block = False
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_str:
-            if c == "\\":
-                i += 2
-                continue
-            if c == '"':
-                in_str = False
-            i += 1
-            continue
-        if in_squote:
-            if c == "\\":
-                i += 2
-                continue
-            if c == "'":
-                in_squote = False
-            i += 1
-            continue
-        if in_tmpl:
-            if c == "\\":
-                i += 2
-                continue
-            if c == "`":
-                in_tmpl = False
-                i += 1
-                continue
-            if c == "$" and i + 1 < n and candidate[i + 1] == "{":
-                # 模板内插：单独平衡
-                i += 2
-                sub_depth = 1
-                sub_in_str = False
-                sub_in_squote = False
-                while i < n and sub_depth > 0:
-                    cc = candidate[i]
-                    if sub_in_str:
-                        if cc == "\\":
-                            i += 2
-                            continue
-                        if cc == '"':
-                            sub_in_str = False
-                        i += 1
-                        continue
-                    if sub_in_squote:
-                        if cc == "\\":
-                            i += 2
-                            continue
-                        if cc == "'":
-                            sub_in_squote = False
-                        i += 1
-                        continue
-                    if cc == '"':
-                        sub_in_str = True
-                        i += 1
-                        continue
-                    if cc == "'":
-                        sub_in_squote = True
-                        i += 1
-                        continue
-                    if cc == "{":
-                        sub_depth += 1
-                    elif cc == "}":
-                        sub_depth -= 1
-                        if sub_depth == 0:
-                            i += 1
-                            break
-                    i += 1
-                continue
-            i += 1
-            continue
-        # Normal
-        if c == "/" and i + 1 < n:
-            if candidate[i + 1] == "/":
-                in_line = True
-                i += 2
-                continue
-            if candidate[i + 1] == "*":
-                in_block = True
-                i += 2
-                continue
-        if c == '"':
-            in_str = True
-            i += 1
-            continue
-        if c == "'":
-            in_squote = True
-            i += 1
-            continue
-        if c == "`":
-            in_tmpl = True
-            i += 1
-            continue
-        # 识别 function 关键字（whole-word）
-        if c == "f" and candidate.startswith("function", i):
-            before_ok = i == 0 or not is_word(candidate[i - 1])
-            after = i + 8
-            after_ok = after >= n or candidate[after] in ("(", " ", "\t", "\n", "\r") or not is_word(candidate[after])
-            if before_ok and after_ok:
-                # 跳过空白
-                j = after
-                while j < n and candidate[j].isspace():
-                    j += 1
-                # 可选的函数名（function name (…) 或匿名 function (…)）
-                if j < n and is_word(candidate[j]):
-                    while j < n and is_word(candidate[j]):
-                        j += 1
-                    while j < n and candidate[j].isspace():
-                        j += 1
-                if j < n and candidate[j] == "(":
-                    # 平衡 () 找参数列表结尾
-                    pdepth = 1
-                    j += 1
-                    p_in_str = False
-                    p_in_squote = False
-                    p_in_tmpl = False
-                    while j < n and pdepth > 0:
-                        cc = candidate[j]
-                        if p_in_str:
-                            if cc == "\\":
-                                j += 2
-                                continue
-                            if cc == '"':
-                                p_in_str = False
-                            j += 1
-                            continue
-                        if p_in_squote:
-                            if cc == "\\":
-                                j += 2
-                                continue
-                            if cc == "'":
-                                p_in_squote = False
-                            j += 1
-                            continue
-                        if p_in_tmpl:
-                            if cc == "\\":
-                                j += 2
-                                continue
-                            if cc == "`":
-                                p_in_tmpl = False
-                            j += 1
-                            continue
-                        if cc == '"':
-                            p_in_str = True
-                            j += 1
-                            continue
-                        if cc == "'":
-                            p_in_squote = True
-                            j += 1
-                            continue
-                        if cc == "`":
-                            p_in_tmpl = True
-                            j += 1
-                            continue
-                        if cc == "(":
-                            pdepth += 1
-                        elif cc == ")":
-                            pdepth -= 1
-                        j += 1
-                    # 跳过空白
-                    while j < n and candidate[j].isspace():
-                        j += 1
-                    if j < n and candidate[j] == "{":
-                        fn_start = i
-                        body_end = _find_matching_brace(candidate, j)
-                        if body_end is None:
-                            i += 1
-                            continue
-                        fn_text = candidate[fn_start:body_end + 1]
-                        placeholder = f"{_FN_PLACEHOLDER_PREFIX}{uuid.uuid4().hex}__"
-                        fn_map[placeholder] = fn_text
-                        out_parts.append(candidate[last:fn_start])
-                        out_parts.append(f'"{placeholder}"')
-                        last = body_end + 1
-                        i = body_end + 1
-                        continue
-        i += 1
-    out_parts.append(candidate[last:])
-    return "".join(out_parts), fn_map
-
-
-def extract_json(raw: str):
-    """从 LLM 回复中提取 ECharts option / 可选 code / 文字解释 + 函数映射。
-
-    返回 ``(option, code, explanation, fn_map)`` 4-tuple：
-    - ``option``: 解析后的 dict（若 option 中含 JS 函数字面量，函数值会被替换为占位符字符串）
-    - ``code``: LLM 额外输出的 JS / Python 代码块（可能为 ``None``）
-    - ``explanation``: 去掉代码块后的文字解释
-    - ``fn_map``: ``{占位符: 原始函数字面量}``；空 dict 表示无函数。前端拿到后把占位符还原成真函数再 ``setOption``。
-
-    解析失败返回 ``None``。解析尝试顺序：
-    1) ``json.loads(candidate)`` —— 纯 JSON 直接过；
-    2) ``_strip_js_functions`` + ``json.loads`` —— option 含 ``function (…) {…}`` 时走这条；
-    3) ``_try_fix_json`` + ``json.loads`` —— 注释 / 尾随逗号时走这条；
-    4) ``_try_fix_json`` + ``_strip_js_functions`` + ``json.loads`` —— 同时含函数和小毛病时走这条。
-    """
-    option: Optional[dict] = None
-    code: Optional[str] = None
-    fn_map: dict = {}
-
-    # 1) 优先：抓 JSON 代码块（带语言标签或不带）。
-    json_block = _RE_JSON_FENCE.search(raw)
-    if json_block:
-        candidate = json_block.group(1)
-    else:
-        # 2) 兜底：栈式扫描第一个完整 {...}。
-        candidate = _scan_json_object(raw)
-
-    if candidate is not None:
-        # 路径 1: 纯 JSON
-        try:
-            option = json.loads(candidate)
-        except Exception:
-            # 路径 2: 含 JS 函数字面量 —— 抠出换成占位符
-            try:
-                cleaned, fn_map = _strip_js_functions(candidate)
-                option = json.loads(cleaned)
-            except Exception:
-                # 路径 3: 注释 / 尾随逗号
-                try:
-                    option = json.loads(_try_fix_json(candidate))
-                    fn_map = {}
-                except Exception:
-                    # 路径 4: 两者兼有
-                    try:
-                        fixed = _try_fix_json(candidate)
-                        cleaned, fn_map = _strip_js_functions(fixed)
-                        option = json.loads(cleaned)
-                    except Exception:
-                        option = None
-                        fn_map = {}
-
-    if option is None:
-        return None
-
-    # 可选 JS / Python 代码块（仅在 LLM 额外输出时存在；只在 raw 里真有 ``` 时再扫）。
-    if "```" in raw:
-        m = _RE_JS_FENCE.search(raw) or _RE_ALT_FENCE.search(raw)
-        if m:
-            code = m.group(1).strip()
-
-    # 解释文本 = 去掉所有代码块后的剩余内容（同样按需扫描）。
-    if "```" in raw:
-        explanation = _RE_ANY_FENCE.sub("", raw).strip()
-    else:
-        explanation = raw.strip()
-    if len(explanation) > _MAX_EXPLANATION:
-        explanation = explanation[:_MAX_EXPLANATION] + "…"
-    return option, code, explanation, fn_map
-
-
-def wrap_code(option: dict, llm_code: str, chart_type: str, fn_map: Optional[dict] = None) -> str:
+def wrap_code(option: dict, llm_code: Optional[str], chart_type: str) -> str:
     """
     生成一段可在前端 chart 容器内直接运行的 JavaScript 代码。
     用户前端只需：
       const chart = echarts.init(document.getElementById('chart'));
       eval(返回代码);  // 或解析后 chart.setOption(option)
     这里返回一份包含 option 与 setOption 的完整代码字符串。
-
-    若 ``fn_map`` 非空，会把 ``json.dumps`` 出来的占位符字符串还原为原始 JS 函数字面量
-    （让 ``setOption`` 拿到真函数而不是字符串）。
     """
-    option_js = json.dumps(option, ensure_ascii=False, indent=2)
-    if fn_map:
-        for placeholder, fn_text in fn_map.items():
-            # 占位符在 json.dumps 里是带引号的 JSON 字符串；替换为原始 JS 源码
-            option_js = option_js.replace(f'"{placeholder}"', fn_text)
     if llm_code and "setOption" in llm_code:
         return llm_code
+    option_js = json.dumps(option, ensure_ascii=False, indent=2)
     return (
         f"// 图表类型：{chart_type}\n"
         f"const option = {option_js};\n"

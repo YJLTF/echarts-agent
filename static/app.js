@@ -1,6 +1,9 @@
 (function () {
   const $ = (sel) => document.querySelector(sel);
 
+  // 缓存「每次生成都会读写」的 DOM 节点，避免 renderResponse 里反复 querySelector
+  const $els = {};
+
   const state = {
     data: null,          // 来自 /api/parse 的解析结果
     chart: null,         // echarts 实例
@@ -20,26 +23,6 @@
     s = String(s);
     return s.length <= max ? s : s.slice(0, max) + "…";
   };
-
-  // 后端把 LLM 输出的 JS 函数字面量（`function (params) {…}`）抠出来换成
-  // 占位符字符串让 `json.loads` 通过；渲染前用 fn_map 还原成真函数，
-  // ECharts 才能正确调用 formatter / color 等。
-  function restoreFunctions(option, fnMap) {
-    if (!option || !fnMap) return option;
-    const walk = (v) => {
-      if (Array.isArray(v)) return v.map(walk);
-      if (v && typeof v === "object") {
-        for (const k of Object.keys(v)) v[k] = walk(v[k]);
-        return v;
-      }
-      if (typeof v === "string" && Object.prototype.hasOwnProperty.call(fnMap, v)) {
-        // eslint-disable-next-line no-new-func
-        return new Function("return " + fnMap[v])();
-      }
-      return v;
-    };
-    return walk(option);
-  }
 
   // -------- Chart ----------
   function setChartTitle(text, color) {
@@ -610,9 +593,7 @@
         return;
       }
       // 一次性把整段 raw_reply 填进流式面板，让用户能事后看到
-      setStageStatus("prepare", "done");
-      setStageStatus("generate", "done");
-      setStageStatus("parse", "done");
+      markAllStagesDone();
       appendStreamText(data.raw_reply || "");
       state.lastResp = data;
       renderResponse(data);
@@ -625,70 +606,82 @@
     }
   }
 
-  // 解析 SSE 流（data: {json}\n\n），逐事件回调
-  async function consumeStream(body, signal) {
+  // 兜底模式下没有真正的 stage 事件；显式把全部阶段标 done（用 detail 凑一句说明）
+  function markAllStagesDone() {
+    setStageStatus("prepare", "done", "✓ 就绪");
+    setStageStatus("understand", "skipped", "未启用");
+    setStageStatus("preprocess", "skipped", "未启用");
+    setStageStatus("pick_type", "skipped", "未启用");
+    setStageStatus("generate", "done", "已生成");
+    setStageStatus("parse", "done", "✓ 一次通过");
+  }
+
+  // 解析 SSE 流：逐事件回调 + 收集最终 done / error
+  // 返回 { done, errored, lastEvt }，让外层只关心"是 done 还是 errored"。
+  async function consumeStream(body) {
     const reader = body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
     let lastEvt = null;
-    let doneResult = null;
+    let done = null;
     let errored = false;
+
+    const handle = (evt) => {
+      lastEvt = evt;
+      if (evt.type === "done") done = evt;
+      else if (evt.type === "error") errored = true;
+      handleStreamEvent(evt);
+    };
+
+    const feed = (chunk) => {
+      buffer += chunk;
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) >= 0) {
+        const evt = parseSseBlock(buffer.slice(0, idx));
+        buffer = buffer.slice(idx + 2);
+        if (evt) handle(evt);
+        if (done || errored) return true;
+      }
+      return false;
+    };
 
     try {
       while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        // 按 SSE 规范以 "\n\n" 切分事件块
-        let idx;
-        while ((idx = buffer.indexOf("\n\n")) >= 0) {
-          const block = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
-          const evt = parseSseBlock(block);
-          if (!evt) continue;
-          lastEvt = evt;
-          handleStreamEvent(evt, {
-            onDone: (d) => { doneResult = d; },
-            onError: () => { errored = true; },
-          });
-          if (errored || doneResult) break;
-        }
-        if (errored || doneResult) break;
+        const { value, isDone } = await reader.read();
+        if (isDone) break;
+        if (feed(decoder.decode(value, { stream: true }))) break;
       }
-      // 流结束但还有尾巴数据
-      const tail = parseSseBlock(buffer);
-      if (tail) handleStreamEvent(tail, {
-        onDone: (d) => { doneResult = d; },
-        onError: () => { errored = true; },
-      });
+      // 流结束，把 buffer 残余当最后一段处理
+      if (!done && !errored && buffer.trim()) {
+        const tail = parseSseBlock(buffer);
+        if (tail) handle(tail);
+      }
     } catch (e) {
-      state.chart.hideLoading();
       if (e.name === "AbortError") throw e;
+      state.chart.hideLoading();
       hideChartStatus();
       showHint("读取流失败：" + e.message, true);
-      return;
+      return { done: null, errored: true, lastEvt };
     }
 
     state.chart.hideLoading();
     hideChartStatus();
 
-    if (doneResult && !errored) {
-      state.lastResp = doneResult;
-      renderResponse(doneResult);
-      let msg = `已生成图表：${doneResult.chart_type} · ${doneResult.type_reason || ""}`;
-      if (doneResult.understanding) {
-        const u = doneResult.understanding;
+    if (done && !errored) {
+      state.lastResp = done;
+      renderResponse(done);
+      let msg = `已生成图表：${done.chart_type} · ${done.type_reason || ""}`;
+      if (done.understanding) {
+        const u = done.understanding;
         if (u.method === "llm") msg += " · 🧠 已用 LLM 整理数据";
         else if (u.method === "fallback") msg += " · ↩ 数据整理已回退";
       }
-      if (doneResult.retried) msg += " · 🔁 已自动修正";
       const elapsed = elapsedSinceStart();
       if (elapsed) msg += ` · 耗时 ${elapsed}`;
       showHint(msg, false, true);
-      setGenSub(`完成 · 图表类型 ${doneResult.chart_type}`);
+      setGenSub(`完成 · 图表类型 ${done.chart_type}`);
     } else if (!errored) {
-      // 流意外结束
+      // 流意外结束但没收到 done / error —— 用最后一个事件的消息兜底
       const msg = (lastEvt && lastEvt.message) || "生成失败：连接中断";
       showHint(msg, true);
       showFallbackError(msg);
@@ -697,16 +690,15 @@
 
   function parseSseBlock(block) {
     if (!block) return null;
-    let data = null;
+    // 按 SSE 规范，每个 event 块以 "\n\n" 结尾；我们只关心 data: 行的第一个 payload
     for (const line of block.split("\n")) {
       if (line.startsWith("data:")) {
         const payload = line.slice(5).trim();
         if (!payload) continue;
-        try { data = JSON.parse(payload); } catch (e) { /* skip */ }
+        try { return JSON.parse(payload); } catch (e) { /* skip */ }
       }
-      // 忽略 event: / id: / retry: 等其它 SSE 字段
     }
-    return data;
+    return null;
   }
 
   // -------- Stage detail templates ----------
@@ -746,7 +738,7 @@
         return `${evt.chart_type || ""}${reason}`;
       },
       generate: (evt) => `已生成 ${evt.length || 0} 字符`,
-      parse:    (evt) => (evt.retried ? "🔁 已自动修正" : "✓ 一次通过"),
+      parse:    (evt) => "✓ 一次通过",
     },
   };
 
@@ -762,7 +754,7 @@
     return fn ? fn(evt || {}) : "已跳过";
   }
 
-  function handleStreamEvent(evt, cbs) {
+  function handleStreamEvent(evt) {
     const t = evt.type;
     if (t === "stage") {
       const stage = evt.stage;
@@ -781,14 +773,12 @@
       }
     } else if (t === "delta") {
       appendStreamText(evt.content || "");
-    } else if (t === "done") {
-      cbs.onDone && cbs.onDone(evt);
     } else if (t === "error") {
       showHint(evt.message || "生成失败", true);
       showFallbackError(evt.message || "生成失败");
-      cbs.onError && cbs.onError();
       setGenStreamLive(false);
     }
+    // "done" 类型由 consumeStream 自行收集并渲染，handleStreamEvent 不用处理
   }
 
   function statusLabel(s) {
@@ -819,21 +809,29 @@
     setChartTitle(msg || "生成失败", "#c0392b");
   }
 
+  // 缓存一次 + 懒填充：第一次访问某个 id 时去 DOM 找
+  function cachedEl(id) {
+    if (!$els[id]) $els[id] = document.getElementById(id);
+    return $els[id];
+  }
+
   function renderResponse(data) {
     try {
-      if (data.fn_map) data.option = restoreFunctions(data.option, data.fn_map);
       state.chart.setOption(data.option, true);
     } catch (e) {
       showFallbackError("图表 option 渲染失败：" + e.message);
     }
-    const reason = document.getElementById("typeReason");
+
+    const reason = cachedEl("typeReason");
     const reasonLine = reason.querySelector(".reason-line");
     const reasonUnd = reason.querySelector(".reason-understanding");
-    let baseReason = "推荐类型：" + data.chart_type + "；理由：" + (data.type_reason || "");
-    if (data.retried) {
-      baseReason += ' <span class="understand-tag">🔁 已自动修正</span>';
-    }
-    reasonLine.innerHTML = baseReason;
+    const parseBadge = data.parse_method && data.parse_method !== "primary"
+      ? ' <span class="understand-tag warn" title="LLM 没有按 schema 输出，已自动兼容">⚠ LLM 偏离 schema</span>'
+      : "";
+    reasonLine.innerHTML =
+      "推荐类型：" + data.chart_type +
+      "；理由：" + (data.type_reason || "") +
+      parseBadge;
 
     // 拼接「理解 + 预处理」两块信息
     const blocks = [];
@@ -866,10 +864,10 @@
     }
     reason.classList.remove("hidden");
 
-    document.getElementById("panel-explain").textContent = data.explanation || "(无文字解释)";
-    document.getElementById("panel-option").textContent = JSON.stringify(data.option, null, 2);
-    document.getElementById("panel-code").textContent = data.code || "(无代码)";
-    document.getElementById("panel-raw").textContent = data.raw_reply || "";
+    cachedEl("panel-explain").textContent = data.content || data.explanation || "(无文字解释)";
+    cachedEl("panel-option").textContent = JSON.stringify(data.option, null, 2);
+    cachedEl("panel-code").textContent = data.code || "(无代码)";
+    cachedEl("panel-raw").textContent = data.raw_reply || "";
   }
 
   // -------- UI helpers ----------
@@ -887,9 +885,37 @@
       const name = tab.dataset.tab;
       document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
       tab.classList.add("active");
-      document.querySelectorAll(".tab-panel").forEach((p) => {
+      document.querySelectorAll(".tab-panel-wrap").forEach((p) => {
         p.classList.toggle("active", p.dataset.panel === name);
       });
+    });
+  });
+
+  // -------- 复制按钮（hover 浮出的 tab 工具） ----------
+  document.querySelectorAll(".tab-copy").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const target = cachedEl(btn.dataset.copyTarget);
+      if (!target) return;
+      const text = target.textContent || "";
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (e) {
+        // 旧浏览器或非安全上下文：降级到 execCommand
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand("copy"); } catch (e2) {}
+        ta.remove();
+      }
+      btn.classList.add("copied");
+      btn.textContent = "✓ 已复制";
+      setTimeout(() => {
+        btn.classList.remove("copied");
+        btn.textContent = "📋 复制";
+      }, 1400);
     });
   });
 
@@ -1096,6 +1122,9 @@ window.addEventListener('resize',()=>chart.resize());
     $("#sysPrompt").value = cfg.system_prompt || "";
     $("#temperature").value = parseFloat(cfg.llm_temperature || 0.7);
     $("#maxTokens").value = parseInt(cfg.llm_max_tokens || 2048, 10);
+    // 思考深度：DB 里可能存空串（=不发送）；UI 上仍选中"关闭"作为对应项
+    const thinking = (cfg.llm_thinking || "").trim().toLowerCase();
+    $("#thinking").value = ["off", "low", "medium", "high"].includes(thinking) ? thinking : "off";
     $("#apiKey").value = "";
     updateKeyStatusUI();
   }
@@ -1122,6 +1151,7 @@ window.addEventListener('resize',()=>chart.resize());
       system_prompt: $("#sysPrompt").value.trim(),
       llm_temperature: parseFloat($("#temperature").value) || 0.7,
       llm_max_tokens: parseInt($("#maxTokens").value, 10) || 2048,
+      llm_thinking: $("#thinking").value || "off",
     };
     if (apiKey) payload.llm_api_key = apiKey;
 
@@ -1158,6 +1188,7 @@ window.addEventListener('resize',()=>chart.resize());
       llm_model: $("#model").value.trim(),
       llm_temperature: parseFloat($("#temperature").value),
       llm_max_tokens: parseInt($("#maxTokens").value, 10),
+      llm_thinking: $("#thinking").value || "off",
     };
     const apiKey = $("#apiKey").value.trim();
     if (apiKey) payload.llm_api_key = apiKey;
