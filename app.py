@@ -818,10 +818,10 @@ def run_chart_pipeline(
     # ---- 6) 主生成：调用 LLM（流式或一次性） ----
     yield {"type": "stage", "stage": "generate", "label": "生成图表配置", "status": "start"}
     raw = ""
+    stream_failed = False
+    stream_error_msg = ""
     try:
         if stream:
-            # 用内层 try-catch 确保流式调用中出现异常时不会中断整个生成器
-            # 任何在流式调用中抛的异常都会在这里捕获，yield 错误事件然后 return
             stream_iter = call_llm_stream(
                 cfg,
                 messages=messages,
@@ -836,24 +836,46 @@ def run_chart_pipeline(
                 except StopIteration:
                     break
                 except Exception as inner_e:
-                    # LLM 流式调用中途失败 —— 转化为错误事件
-                    yield {
-                        "type": "stage",
-                        "stage": "generate",
-                        "status": "error",
-                        "message": str(inner_e),
-                    }
-                    yield {
-                        "type": "error",
-                        "message": f"模型流式调用失败：{inner_e}",
-                        "raw_reply": raw,
-                        "status": 500,
-                    }
-                    return
+                    # LLM 流式调用中途失败 —— 记录错误，但不立即 return
+                    # 而是尝试用已收到的部分结果继续解析（降级）
+                    stream_failed = True
+                    stream_error_msg = str(inner_e)
+                    print(f"[pipeline] LLM 流式中途失败: {inner_e} (已收到 {len(raw)} 字符)", flush=True)
+                    break
                 raw += chunk
                 if chunk:
                     yield {"type": "delta", "content": chunk}
             reasoning = ""
+
+            # 流式中途失败且有部分输出 → 尝试降级解析
+            if stream_failed and not raw.strip():
+                # 完全没收到数据 → 报错
+                yield {
+                    "type": "stage",
+                    "stage": "generate",
+                    "status": "error",
+                    "message": stream_error_msg,
+                }
+                yield {
+                    "type": "error",
+                    "message": f"模型流式调用失败：{stream_error_msg}",
+                    "raw_reply": raw,
+                    "status": 500,
+                }
+                return
+            elif stream_failed:
+                # 有部分输出 → 尝试用已有数据继续解析（降级模式）
+                yield {
+                    "type": "stage",
+                    "stage": "generate",
+                    "status": "done",
+                    "length": len(raw),
+                    "degraded": True,
+                    "degraded_reason": stream_error_msg,
+                }
+                yield {"type": "delta", "content": "\n\n[注：模型输出中断，已用部分结果降级解析]"}
+            else:
+                pass  # 正常完成
         else:
             raw, reasoning = call_llm_raw(
                 cfg,
@@ -866,6 +888,7 @@ def run_chart_pipeline(
             if reasoning:
                 raw = f"<think>\n{reasoning}\n</think>\n\n{raw}"
     except Exception as e:
+        print(f"[pipeline] 生成阶段异常: {e}", flush=True)
         yield {
             "type": "stage",
             "stage": "generate",
@@ -874,7 +897,8 @@ def run_chart_pipeline(
         }
         yield {"type": "error", "message": f"模型调用失败：{e}", "raw_reply": raw, "status": 500}
         return
-    yield {"type": "stage", "stage": "generate", "status": "done", "length": len(raw)}
+    if not stream_failed:
+        yield {"type": "stage", "stage": "generate", "status": "done", "length": len(raw)}
 
     # ---- 7) 解析（结构化输出 → 一次 json.loads 即够） ----
     yield {"type": "stage", "stage": "parse", "label": "解析与校验", "status": "start"}
