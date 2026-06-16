@@ -212,8 +212,8 @@ class ChatOpenAIWrapper:
 
         # 用 .bind() 把参数绑定到 LLM 上
         bind_kwargs: Dict[str, Any] = {"max_tokens": max_t, "temperature": temp}
-        # 结构化输出格式
-        if response_format is not None:
+        # response_format 只对 OpenAI 兼容 provider 有效；Ollama / GLM 等不支持 json_schema 格式，跳过以避免 502
+        if response_format is not None and self.provider not in ("ollama", "glm"):
             bind_kwargs["response_format"] = response_format
         # reasoning_effort / thinking 等 provider 特有字段通过 extra_body 传递
         extra_body = resolve_extra_kwargs(
@@ -264,7 +264,8 @@ class ChatOpenAIWrapper:
 
         # 用 .bind() 绑定所有运行时参数
         bind_kwargs: Dict[str, Any] = {"max_tokens": max_t, "temperature": temp}
-        if response_format is not None:
+        # response_format 只对 OpenAI 兼容 provider 有效；Ollama / GLM 等不支持 json_schema 格式，跳过以避免 502
+        if response_format is not None and self.provider not in ("ollama", "glm"):
             bind_kwargs["response_format"] = response_format
         extra_body = resolve_extra_kwargs(
             self.base_url, reasoning_effort or self.reasoning_effort, self.provider
