@@ -42,7 +42,7 @@ def call_llm(
     )
     ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"LLM 服务 HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')[:500]}")
@@ -81,9 +81,16 @@ def pick_chart_type(
 
     data_desc = ""
     if data and data.get("rows"):
-        cols = ", ".join(data.get("columns", []))
+        raw_cols = data.get("columns") or []
+        if raw_cols and isinstance(raw_cols[0], dict):
+            cols = ", ".join(str(c.get("name") or "") for c in raw_cols)
+        else:
+            cols = ", ".join(str(c) for c in raw_cols)
         sample = json.dumps(data["rows"][:3], ensure_ascii=False)
-        data_desc = f"\n数据字段：{cols}\n样例：{sample}\n行数：{len(data['rows'])}"
+        extra = ""
+        if data.get("summary"):
+            extra = f"\n数据集摘要：{data['summary']}"
+        data_desc = f"\n数据字段：{cols}\n样例：{sample}\n行数：{len(data['rows'])}{extra}"
 
     system = (
         "你是一个专业的数据可视化助手，请根据用户的需求与数据，推荐一个最合适的 ECharts 图表类型。"
@@ -102,6 +109,110 @@ def pick_chart_type(
     return chart_type, reason
 
 
+def _percentile(sorted_nums: List[float], q: float) -> float:
+    """线性插值分位数（与 numpy.percentile 默认行为一致）。"""
+    if not sorted_nums:
+        return 0.0
+    n = len(sorted_nums)
+    if n == 1:
+        return sorted_nums[0]
+    k = (n - 1) * q
+    f = int(k)
+    c = min(f + 1, n - 1)
+    if f == c:
+        return sorted_nums[f]
+    return sorted_nums[f] + (sorted_nums[c] - sorted_nums[f]) * (k - f)
+
+
+def compute_column_stats(
+    rows: List[Dict[str, Any]],
+    column_names: List[str],
+) -> str:
+    """给一份行数据算每列的紧凑统计，喂给 LLM 让它对「全量」有概念。
+
+    - 每列一行：列名 (类型) + 范围 / 分布 / distinct / top-k
+    - 数值列：min / max / mean / median / p25 / p75 / IQR（>100 行）
+    - 文本列：distinct / top-3 with counts
+    - 总体限 ~ 200 字符/列，top-k 至多 3 项
+
+    Returns "" 当行数太少（< 20）或没有列 —— 小数据直接看样本就够了。
+    """
+    if not rows or not column_names or len(rows) < 20:
+        return ""
+
+    def _try_float(v: Any) -> Optional[float]:
+        if v is None or isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip().replace(",", "").replace(" ", "")
+        if s in ("", "-", "—"):
+            return None
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            return None
+
+    def _fmt_num(x: float) -> str:
+        # 自动取整显示：整数 1234.0 → "1234"；小数 → "1.23"
+        if x == int(x) and abs(x) < 1e15:
+            return f"{int(x):,}"
+        return f"{x:,.2f}"
+
+    show_percentiles = len(rows) >= 100
+    lines: List[str] = []
+    for col in column_names:
+        if not col:
+            continue
+        vals = [r.get(col) for r in rows]
+        non_null = [v for v in vals if v is not None and v != ""]
+        nulls = len(vals) - len(non_null)
+
+        if not non_null:
+            lines.append(f"- {col}: 全空")
+            continue
+
+        # 试判数值
+        nums: List[float] = []
+        for v in non_null:
+            fv = _try_float(v)
+            if fv is not None:
+                nums.append(fv)
+        is_numeric = len(nums) >= len(non_null) * 0.7
+        null_part = f", {nulls} 空" if nulls else ""
+
+        if is_numeric:
+            nums_sorted = sorted(nums)
+            distinct = len(set(nums_sorted))
+            lo, hi = nums_sorted[0], nums_sorted[-1]
+            range_str = f"={_fmt_num(lo)}" if lo == hi else f"{_fmt_num(lo)}–{_fmt_num(hi)}"
+            mean = sum(nums) / len(nums)
+            parts = [f"范围 {range_str}", f"均值 {_fmt_num(mean)}", f"{distinct} distinct"]
+            if show_percentiles:
+                med = _percentile(nums_sorted, 0.5)
+                p25 = _percentile(nums_sorted, 0.25)
+                p75 = _percentile(nums_sorted, 0.75)
+                iqr = p75 - p25
+                parts.append(f"中位数 {_fmt_num(med)}")
+                parts.append(f"p25-p75 {_fmt_num(p25)}–{_fmt_num(p75)}")
+                if iqr > 0 and distinct > 4:
+                    parts.append(f"IQR {_fmt_num(iqr)}")
+            line = f"- {col} (数字, {len(non_null)} 值{null_part}): " + ", ".join(parts)
+        else:
+            from collections import Counter
+            cnt = Counter(str(v) for v in non_null)
+            distinct = len(cnt)
+            top = cnt.most_common(3)
+            top_str = ", ".join(f'"{k}"({n})' for k, n in top)
+            line = f"- {col} (文本, {len(non_null)} 值{null_part}): {distinct} distinct, top: {top_str}"
+
+        if len(line) > 240:
+            line = line[:237] + "..."
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
 def build_chart_prompt(
     prompt: str,
     data: Optional[Dict[str, Any]],
@@ -115,10 +226,26 @@ def build_chart_prompt(
         pieces.append(f"用户需求：{prompt}")
 
     if data and data.get("rows"):
-        columns = data["columns"]
+        # 兼容两种列描述：纯字符串列表 / 带 schema 的对象列表（来自 LLM 整理）
+        raw_cols = data.get("columns") or []
+        if raw_cols and isinstance(raw_cols[0], dict):
+            column_names = [str(c.get("name") or "") for c in raw_cols]
+            schema_lines = [
+                f"- {c.get('name')} ({c.get('type','string')}/{c.get('role','value')}): {c.get('description','')}"
+                for c in raw_cols
+            ]
+            pieces.append("数据 schema：\n" + "\n".join(schema_lines))
+        else:
+            column_names = [str(c) for c in raw_cols]
         rows = data["rows"]
-        pieces.append("数据字段：" + ", ".join(columns))
-        # 为了节省 token，超过 100 行则压缩为前 100 行，并告知总行数
+        pieces.append("数据字段：" + ", ".join(column_names))
+
+        # 1) 整体统计（>20 行才发）—— LLM 能借此理解全量分布
+        stats_text = compute_column_stats(rows, column_names)
+        if stats_text:
+            pieces.append(f"【数据统计摘要 (共 {len(rows)} 行)】\n{stats_text}")
+
+        # 2) 样本行（>100 行只发前 100）
         if len(rows) > 100:
             shown = rows[:100]
             pieces.append(f"数据共 {len(rows)} 行，仅发送前 100 行用于演示；"
@@ -127,6 +254,12 @@ def build_chart_prompt(
             shown = rows
         pieces.append("数据 JSON：")
         pieces.append(json.dumps(shown, ensure_ascii=False))
+
+        # 如果有 LLM 整理产出的 summary/notes，附带给 chart 生成模型
+        if data.get("summary"):
+            pieces.append(f"数据集摘要：{data['summary']}")
+        if data.get("notes") and data.get("notes") not in ("", "无"):
+            pieces.append(f"数据整理说明：{data['notes']}")
 
     if style_hint:
         pieces.append(f"样式偏好：{json.dumps(style_hint, ensure_ascii=False)}")

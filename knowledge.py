@@ -226,16 +226,39 @@ TYPE_BODY: Dict[str, str] = {
 }
 
 
+# 哪些图表类型用得到 axis / legend。
+# 不相关章节不发给 LLM，节省 token、减少噪音。
+CHART_USES_AXIS: Dict[str, bool] = {
+    "bar": True, "line": True, "scatter": True, "heatmap": True,
+    "candlestick": True, "boxplot": True, "pictorialbar": True,
+    "effectscatter": True, "radar": True,
+    "pie": False, "funnel": False, "sunburst": False,
+    "treemap": False, "sankey": False, "gauge": False,
+}
+# tooltip 对所有图表都适用（hover 提示）；不分类
+
+
 def get_knowledge_for_type(chart_type: str) -> Dict[str, str]:
+    """按图表类型裁剪 KB：只发相关章节。
+
+    通用基础 + 图表类型详情 永远发；tooltip 永远发（每个图表都有 hover 提示）；
+    axis / legend 按 CHART_USES_AXIS 表按需发。
+    这样 prompt 更紧凑、LLM 注意力更集中、token 也省。
+    """
     ct = (chart_type or "").lower().strip()
     body = TYPE_BODY.get(ct, BAR)
-    return {
+    sections: Dict[str, str] = {
         "通用基础": GENERAL,
         "tooltip": TOOLTIP,
-        "legend": LEGEND,
-        "轴配置 (xAxis / yAxis)": AXIS,
-        f"图表类型：{ct}": body,
+        f"图表类型：{ct or 'bar'}": body,
     }
+    if CHART_USES_AXIS.get(ct, True):
+        sections["轴配置 (xAxis / yAxis)"] = AXIS
+    # legend 在 pie / funnel / sunburst / treemap / sankey / radar / 多 series 图表里都很有用
+    # 简化起见：除单系列的 gauge / heatmap / candlestick / boxplot 之外都发
+    if ct not in ("gauge", "heatmap", "candlestick", "boxplot"):
+        sections["legend"] = LEGEND
+    return sections
 
 
 def search_knowledge(query: str) -> Dict[str, str]:

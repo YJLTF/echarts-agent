@@ -10,3 +10,4 @@ app.db
 .DS_Store
 # 可能包含密钥的备份
 *.bak
+data/

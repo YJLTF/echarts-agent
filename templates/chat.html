@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>ECharts Agent - 可视化对话</title>
   <link rel="stylesheet" href="/static/app.css" />
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <script src="/static/vendor/echarts/echarts.min.js"></script>
 </head>
 <body>
 <div class="app">
@@ -18,82 +18,107 @@
       </div>
     </div>
 
-    <nav class="nav">
-      <a href="/" class="nav-item active">💬 对话</a>
-      <a href="/config" class="nav-item">⚙️ 配置</a>
-    </nav>
-
-    <div class="sidebar-section">
-      <div class="section-title">1. 上传或粘贴数据</div>
-      <div class="file-zone">
-        <label class="file-btn" title="支持 xlsx / xls / csv / json">
-          <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.json,.txt" />
-          📂 选择文件
+    <div class="sidebar-body">
+      <div class="sidebar-section">
+        <div class="section-title">1. 上传或粘贴数据</div>
+        <div class="file-zone">
+          <label class="file-btn" title="支持 xlsx / xls / csv / json">
+            <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.json,.txt" />
+            📂 选择文件
+          </label>
+          <span id="fileName" class="file-name">未选择文件</span>
+        </div>
+        <textarea id="textInput" rows="4" placeholder="也可直接粘贴 CSV / JSON / 文本数据…"></textarea>
+        <label class="check-row" title="对不规范数据（多级表头、含单位、合计行、错位等）让大模型先整理">
+          <input type="checkbox" id="useLlmChk" />
+          <span>🧠 用大模型智能整理（适合不规范数据）</span>
         </label>
-        <span id="fileName" class="file-name">未选择文件</span>
+        <label class="check-row" title="文件没有表头行：把第一行当数据，列名自动生成 字段1 / 字段2 / ...">
+          <input type="checkbox" id="noHeaderChk" />
+          <span>📋 首行是数据（无表头）</span>
+        </label>
+        <div class="row">
+          <button class="btn btn-ghost" id="btnParse">🔍 解析数据</button>
+          <button class="btn btn-ghost" id="btnClearData">清空</button>
+        </div>
+        <div id="sheetPicker" class="sheet-picker hidden">
+          <div class="sheet-picker-head">
+            <div class="section-title sheet-picker-title">📑 选择 Sheet（可多选）</div>
+            <div class="row sheet-picker-actions">
+              <button class="btn btn-ghost btn-mini" id="btnSheetsAll" type="button">全选</button>
+              <button class="btn btn-ghost btn-mini" id="btnSheetsNone" type="button">全不选</button>
+            </div>
+          </div>
+          <div id="sheetList" class="sheet-list"></div>
+          <div class="row sheet-picker-foot">
+            <span id="sheetPickerHint" class="muted-small sheet-picker-hint">提示：多 sheet 会被合并，并自动加一列「__sheet__」标识来源</span>
+            <button class="btn btn-primary btn-mini" id="btnSheetsConfirm" type="button">确认解析</button>
+          </div>
+        </div>
+        <div id="dataSummary" class="data-summary hidden"></div>
+        <div class="row data-preview-actions hidden" id="dataPreviewActions">
+          <span class="muted-small" style="flex:1">预览（前 5 行 + schema）</span>
+          <button class="btn btn-ghost btn-mini" id="btnTogglePreview" type="button" title="展开 / 收起数据预览">📊 展开数据 ▾</button>
+        </div>
+        <pre id="dataPreview" class="data-preview hidden"></pre>
       </div>
-      <textarea id="textInput" rows="4" placeholder="也可直接粘贴 CSV / JSON / 文本数据…"></textarea>
-      <div class="row">
-        <button class="btn btn-ghost" id="btnParse">🔍 解析数据</button>
-        <button class="btn btn-ghost" id="btnClearData">清空</button>
+
+      <div class="sidebar-section">
+        <div class="section-title">2. 可选：指定图表样式</div>
+        <div class="row grid-2">
+          <label>主题
+            <select id="themeSel">
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <label>图表类型
+            <select id="typeSel">
+              <option value="">自动</option>
+              <option value="bar">柱状图 bar</option>
+              <option value="line">折线图 line</option>
+              <option value="pie">饼图 pie</option>
+              <option value="scatter">散点 scatter</option>
+              <option value="radar">雷达 radar</option>
+              <option value="gauge">仪表 gauge</option>
+              <option value="funnel">漏斗 funnel</option>
+              <option value="heatmap">热力 heatmap</option>
+              <option value="sunburst">旭日 sunburst</option>
+              <option value="treemap">树图 treemap</option>
+              <option value="sankey">桑基 sankey</option>
+              <option value="candlestick">K线 candlestick</option>
+              <option value="boxplot">箱线 boxplot</option>
+              <option value="effectScatter">涟漪 effectScatter</option>
+              <option value="pictorialBar">象形 pictorialBar</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label><input type="text" id="titleInput" placeholder="图表标题（可选）" /></label>
+        </div>
       </div>
-      <pre id="dataPreview" class="data-preview hidden"></pre>
+
+      <div class="sidebar-footer">
+        <span class="dot"></span> 所有计算在本地完成 · 唯一外联是 LLM API
+      </div>
     </div>
 
-    <div class="sidebar-section">
-      <div class="section-title">2. 可选：指定图表样式</div>
-      <div class="row grid-2">
-        <label>主题
-          <select id="themeSel">
-            <option value="light">Light</option>
-            <option value="dark">Dark</option>
-          </select>
-        </label>
-        <label>图表类型
-          <select id="typeSel">
-            <option value="">自动</option>
-            <option value="bar">柱状图 bar</option>
-            <option value="line">折线图 line</option>
-            <option value="pie">饼图 pie</option>
-            <option value="scatter">散点 scatter</option>
-            <option value="radar">雷达 radar</option>
-            <option value="gauge">仪表 gauge</option>
-            <option value="funnel">漏斗 funnel</option>
-            <option value="heatmap">热力 heatmap</option>
-            <option value="sunburst">旭日 sunburst</option>
-            <option value="treemap">树图 treemap</option>
-            <option value="sankey">桑基 sankey</option>
-            <option value="candlestick">K线 candlestick</option>
-            <option value="boxplot">箱线 boxplot</option>
-            <option value="effectScatter">涟漪 effectScatter</option>
-            <option value="pictorialBar">象形 pictorialBar</option>
-          </select>
-        </label>
-      </div>
-      <div class="row">
-        <label><input type="text" id="titleInput" placeholder="图表标题（可选）" /></label>
-      </div>
-    </div>
-
-    <div class="sidebar-section grow">
+    <div class="sidebar-bottom">
       <div class="section-title">3. 发送需求</div>
-      <textarea id="promptInput" rows="5" placeholder="例如：用数据里的“月份”作为 X 轴，“销售额”作为 Y 轴，生成柱状图并平滑为圆角。"></textarea>
+      <textarea id="promptInput" rows="3" placeholder="例如：用数据里的「月份」作 X 轴，「销售额」作 Y 轴，生成柱状图并带圆角。"></textarea>
       <div class="row">
         <button class="btn btn-primary" id="btnGen">✨ 生成图表</button>
         <button class="btn btn-ghost" id="btnSample">加载示例</button>
       </div>
       <div id="hintMsg" class="hint hidden"></div>
     </div>
-
-    <div class="sidebar-footer">
-      <span class="dot"></span> 所有生成与配置均在本地完成（无需联网搜索）
-    </div>
   </aside>
 
   <main class="main">
     <header class="main-head">
-      <div class="head-title">对话</div>
+      <div class="head-title">结果</div>
       <div class="head-actions">
+        <button class="btn btn-ghost" id="btnConfigOpen" title="模型与系统配置">⚙️ 配置</button>
         <button class="btn btn-ghost" id="btnExport">📥 导出代码</button>
         <button class="btn btn-ghost" id="btnFullscreen">⛶ 全屏查看</button>
       </div>
@@ -101,10 +126,19 @@
 
     <section class="chart-area">
       <div id="chart" class="chart"></div>
+      <div id="chartStatus" class="chart-status hidden">
+        <span class="dot-pulse"></span>
+        <span id="chartStatusText">准备中…</span>
+        <span class="spacer"></span>
+        <button class="btn btn-ghost btn-mini" id="btnCancelGen" type="button" title="取消本次生成">✕ 取消</button>
+      </div>
     </section>
 
     <section class="reply-area">
-      <div id="typeReason" class="reason hidden"></div>
+      <div id="typeReason" class="reason hidden">
+        <div class="reason-line"></div>
+        <div class="reason-understanding hidden"></div>
+      </div>
       <div class="tabs">
         <button class="tab active" data-tab="explain">文字解释</button>
         <button class="tab" data-tab="option">option JSON</button>
@@ -121,6 +155,67 @@
   </main>
 </div>
 
+<!-- ====== Config Modal ====== -->
+<div id="configModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="configModalTitle">
+  <div class="modal-backdrop" data-config-close></div>
+  <div class="modal-card" role="document">
+    <div class="modal-head">
+      <div id="configModalTitle" class="modal-title">⚙️ 模型与系统配置</div>
+      <button class="modal-close" data-config-close title="关闭 (Esc)">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>Base URL <small>以 https:// 或 http:// 开头，结尾无需带 /v1（自动追加 /chat/completions）</small></label>
+        <input type="text" id="baseUrl" placeholder="https://api.openai.com/v1" />
+      </div>
+
+      <div class="form-group">
+        <label>API Key <small>明文保存在本地 SQLite，仅本机使用；不会上传到任何第三方</small></label>
+        <div id="apiKeyStatus" class="key-status hidden">
+          <span>已配置：<code id="apiKeyMasked"></code></span>
+          <button class="btn btn-ghost btn-mini" id="btnEditKey" type="button">✏️ 修改</button>
+        </div>
+        <div class="row" id="apiKeyInputRow">
+          <input type="password" id="apiKey" class="grow" placeholder="sk-..." autocomplete="off" />
+          <button class="btn btn-ghost" id="btnToggleKey" type="button">👁 显示</button>
+        </div>
+      </div>
+
+      <div class="form-group grid-2">
+        <label>模型名称
+          <input type="text" id="model" placeholder="gpt-4o-mini / deepseek-chat / qwen-max / ..." />
+        </label>
+        <label>Temperature
+          <input type="number" id="temperature" step="0.1" min="0" max="2" value="0.7" />
+        </label>
+      </div>
+
+      <div class="form-group">
+        <label>最大 Token（max_tokens）
+          <input type="number" id="maxTokens" value="2048" />
+        </label>
+      </div>
+
+        <div class="form-group">
+          <label>系统提示词（System Prompt）<small>留空将使用默认（推荐）—— 内置硬约束 + 最小可用结构示例。</small></label>
+          <textarea id="sysPrompt" rows="5" placeholder="你是一名资深的 Apache ECharts 图表工程师…（留空用默认）"></textarea>
+        </div>
+
+      <div id="testResult" class="hint hidden"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="btnTest" type="button">🔌 测试连接</button>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost" data-config-close type="button">取消</button>
+      <button class="btn btn-primary" id="btnSave" type="button">💾 保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // 是否需要在加载时自动打开配置弹窗（来自 /config 直链）
+  window.__autoOpenConfig = {{ "true" if config_open else "false" }};
+</script>
 <script src="/static/app.js"></script>
 </body>
 </html>
