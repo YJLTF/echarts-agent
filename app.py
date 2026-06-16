@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 from functools import wraps
 from typing import Optional
 
+# 清除 LLM wrapper 缓存，确保每次使用最新配置
+import llm_client
+llm_client._llm_wrapper_cache.clear()
+
 from flask import (
     Flask,
     Response,
@@ -832,7 +836,6 @@ def run_chart_pipeline(
             if reasoning:
                 raw = f"<think>\n{reasoning}\n</think>\n\n{raw}"
     except Exception as e:
-        print(f"[DEBUG] LLM call failed: {e}")
         yield {
             "type": "stage",
             "stage": "generate",
@@ -841,7 +844,6 @@ def run_chart_pipeline(
         }
         yield {"type": "error", "message": f"模型调用失败：{e}", "raw_reply": raw, "status": 500}
         return
-    print(f"[DEBUG] LLM response received, length={len(raw)}, first_100={raw[:100]!r}")
     yield {"type": "stage", "stage": "generate", "status": "done", "length": len(raw)}
 
     # ---- 7) 解析（结构化输出 → 一次 json.loads 即够） ----
