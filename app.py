@@ -687,7 +687,6 @@ def api_chart_stream():
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
             "X-Powered-By": "echarts-agent",
         },
     )
