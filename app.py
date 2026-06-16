@@ -994,21 +994,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     host = os.environ.get("HOST", "0.0.0.0")
     print(f"[ECharts Agent] starting on http://{host}:{port}")
-
-    # 优先用 waitress（生产级 WSGI，流式响应不会被开发服务器缓冲）；
-    # 若 waitress 未安装则退回 Flask 开发服务器 + threaded=True，确保流式能跑。
-    try:
-        from waitress import serve
-
-        print(f"[ECharts Agent] using waitress (WSGI)")
-        serve(
-            app,
-            host=host,
-            port=port,
-            threads=8,
-            # waitress 内部会把 write() 立刻 flush，不用额外 backlog 设置
-            channel_timeout=300,  # 允许一次请求最多跑 5 分钟（大模型流式）
-        )
-    except Exception as e:
-        print(f"[ECharts Agent] waitress 不可用（{e}），退回 Flask 开发服务器")
-        app.run(host=host, port=port, debug=False, threaded=True)
+    print(f"[ECharts Agent] using Flask dev server (threaded, streaming-friendly)")
+    # Flask 开发服务器 + threaded=True 原生支持流式响应逐 chunk flush；
+    # waitress 会缓冲响应体，不适合 SSE 流式。
+    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
