@@ -2,14 +2,44 @@
   const $ = (sel) => document.querySelector(sel);
 
   const state = {
-    data: null,        // 来自 /api/parse 的解析结果
-    chart: null,       // echarts 实例
+    data: null,          // 来自 /api/parse 的解析结果
+    chart: null,         // echarts 实例
     chartTheme: "light",
-    lastResp: null,    // 最近一次 /api/chart 响应
-    config: null,      // 最近一次 /api/config 响应（不含明文 key）
-    pendingFile: null, // 当前正被「选 sheet」阻塞的原始 File 对象（用于二次提交）
+    lastResp: null,      // 最近一次 /api/chart 响应
+    config: null,        // 最近一次 /api/config 响应（不含明文 key）
+    pendingFile: null,   // 当前正被「选 sheet」阻塞的原始 File 对象（用于二次提交）
     genController: null, // AbortController：用于「取消」按钮中断请求
+    genStartedAt: 0,     // 当前生成开始的时间戳（用于显示耗时）
   };
+
+  // -------- Small utilities ----------
+  const hide = (el) => el && el.classList.add("hidden");
+  const show = (el) => el && el.classList.remove("hidden");
+  const shortText = (s, max) => {
+    if (s == null) return "";
+    s = String(s);
+    return s.length <= max ? s : s.slice(0, max) + "…";
+  };
+
+  // 后端把 LLM 输出的 JS 函数字面量（`function (params) {…}`）抠出来换成
+  // 占位符字符串让 `json.loads` 通过；渲染前用 fn_map 还原成真函数，
+  // ECharts 才能正确调用 formatter / color 等。
+  function restoreFunctions(option, fnMap) {
+    if (!option || !fnMap) return option;
+    const walk = (v) => {
+      if (Array.isArray(v)) return v.map(walk);
+      if (v && typeof v === "object") {
+        for (const k of Object.keys(v)) v[k] = walk(v[k]);
+        return v;
+      }
+      if (typeof v === "string" && Object.prototype.hasOwnProperty.call(fnMap, v)) {
+        // eslint-disable-next-line no-new-func
+        return new Function("return " + fnMap[v])();
+      }
+      return v;
+    };
+    return walk(option);
+  }
 
   // -------- Chart ----------
   function setChartTitle(text, color) {
@@ -314,8 +344,58 @@
   }
 
   // -------- Send prompt to generate chart ----------
-  // AbortController：用于「取消」按钮中断请求
-  state.genController = null;
+  // 统一的请求体构造：generate() 与 generateFallback() 都要用
+  function buildChartBody() {
+    const prompt = $("#promptInput").value.trim();
+    const title = $("#titleInput").value.trim();
+    const typeHint = $("#typeSel").value;
+    const theme = $("#themeSel").value;
+    const wantUnderstand = $("#understandChk") && $("#understandChk").checked;
+    let dataForChart = state.data;
+    if (dataForChart) {
+      dataForChart = { ...dataForChart };
+      if (wantUnderstand) dataForChart.need_understanding = true;
+      else delete dataForChart.need_understanding;
+    }
+    return {
+      prompt,
+      data: dataForChart,
+      chart_type_hint: typeHint || "",
+      style_hint: { theme, title },
+    };
+  }
+
+  // 把生成按钮设为 disabled + 记录开始时间 + 启动顶部状态条耗时定时器
+  let _elapsedTimer = null;
+  function setGenBusy(busy) {
+    $("#btnSample").disabled = busy;
+    const btn = $("#btnGen");
+    if (!btn) return;
+    btn.disabled = busy;
+    btn.textContent = busy ? "⏳ 生成中…" : "✨ 生成图表";
+    if (busy) {
+      state.genStartedAt = Date.now();
+      updateElapsedLabel();
+      if (_elapsedTimer) clearInterval(_elapsedTimer);
+      _elapsedTimer = setInterval(updateElapsedLabel, 1000);
+    } else {
+      if (_elapsedTimer) { clearInterval(_elapsedTimer); _elapsedTimer = null; }
+      updateElapsedLabel();  // 闪一次最终耗时
+    }
+  }
+
+  function updateElapsedLabel() {
+    const el = $("#chartStatusElapsed");
+    if (!el) return;
+    const elapsed = elapsedSinceStart();
+    el.textContent = elapsed ? `(${elapsed})` : "";
+  }
+
+  function elapsedSinceStart() {
+    if (!state.genStartedAt) return "";
+    const sec = Math.round((Date.now() - state.genStartedAt) / 1000);
+    return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m${sec % 60}s`;
+  }
 
   function setChartStatus(text, show) {
     const el = $("#chartStatus");
@@ -324,13 +404,134 @@
     if (el) el.classList.toggle("hidden", !show);
   }
 
-  async function generate() {
-    const prompt = $("#promptInput").value.trim();
-    const title = $("#titleInput").value.trim();
-    const typeHint = $("#typeSel").value;
-    const theme = $("#themeSel").value;
+  function hideChartStatus() {
+    setChartStatus("", false);
+  }
 
-    if (!prompt && !state.data) {
+  // -------- Generation progress panel (streaming) ----------
+  const STAGE_LABELS = {
+    prepare: "数据准备",
+    understand: "智能数据整理",
+    preprocess: "数据预处理",
+    pick_type: "选择图表类型",
+    generate: "生成图表配置",
+    parse: "解析与校验",
+  };
+
+  function resetGenPanel() {
+    const panel = $("#genPanel");
+    if (panel) panel.classList.add("hidden");
+    document.querySelectorAll("#genStages .gen-stage").forEach((li) => {
+      li.classList.remove("running", "done", "error", "skipped");
+      const icon = li.querySelector(".gen-stage-icon");
+      if (icon) icon.textContent = "○";
+      const detail = li.querySelector(".gen-stage-detail");
+      if (detail) detail.textContent = "";
+    });
+    const sub = $("#genPanelSub");
+    if (sub) sub.textContent = "等待开始…";
+    const stream = $("#genStreamText");
+    if (stream) {
+      stream.textContent = "";
+      stream.classList.remove("live");
+    }
+    const streamWrap = $("#genStreamWrap");
+    if (streamWrap) streamWrap.classList.add("hidden");
+    const stat = $("#genStreamStat");
+    if (stat) stat.textContent = "";
+  }
+
+  function showGenPanel() {
+    const panel = $("#genPanel");
+    if (panel) panel.classList.remove("hidden");
+    // 每次显示（用户刚点"生成图表"）都强制展开，让他能看到进度
+    setGenPanelCollapsed(false);
+  }
+
+  // -------- Generation progress panel: collapse / expand ----------
+  // 折叠状态持久化到 localStorage；用户每次"生成图表"时都强制展开。
+  const GEN_PANEL_KEY = "ea.genPanelCollapsed";
+
+  function setGenPanelCollapsed(collapsed) {
+    const panel = $("#genPanel");
+    const head = $("#genPanelHead");
+    const toggle = $("#genPanelToggle");
+    if (!panel || !head) return;
+    const next = !!collapsed;
+    panel.classList.toggle("collapsed", next);
+    head.setAttribute("aria-expanded", String(!next));
+    if (toggle) {
+      toggle.setAttribute("aria-label", next ? "展开" : "折叠");
+      toggle.setAttribute("title", next ? "展开" : "折叠");
+    }
+    try { localStorage.setItem(GEN_PANEL_KEY, next ? "1" : "0"); } catch (e) { /* ignore */ }
+  }
+
+  function toggleGenPanel() {
+    const head = $("#genPanelHead");
+    if (!head) return;
+    setGenPanelCollapsed(head.getAttribute("aria-expanded") === "true");
+  }
+
+  function initGenPanelCollapse() {
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(GEN_PANEL_KEY) === "1"; } catch (e) { /* ignore */ }
+    setGenPanelCollapsed(collapsed);
+    const head = $("#genPanelHead");
+    if (!head) return;
+    head.addEventListener("click", toggleGenPanel);
+    head.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggleGenPanel();
+      }
+    });
+  }
+
+  // 把后端的 "start" 状态映射到 CSS 的 .running 类
+  function setStageStatus(stageName, status, detail) {
+    const li = document.querySelector(`#genStages .gen-stage[data-stage="${stageName}"]`);
+    if (!li) return;
+    li.classList.remove("running", "done", "error", "skipped");
+    const visual = status === "start" ? "running" : status;
+    li.classList.add(visual);
+    const icon = li.querySelector(".gen-stage-icon");
+    if (icon) icon.textContent = ICON_FOR[visual] || "○";
+    const det = li.querySelector(".gen-stage-detail");
+    if (det) det.textContent = detail || "";
+  }
+
+  function setGenSub(text) {
+    const el = $("#genPanelSub");
+    if (el) el.textContent = text;
+  }
+
+  function showGenStream() {
+    const wrap = $("#genStreamWrap");
+    if (wrap) wrap.classList.remove("hidden");
+  }
+
+  function setGenStreamLive(live) {
+    const stream = $("#genStreamText");
+    if (stream) stream.classList.toggle("live", !!live);
+  }
+
+  function appendStreamText(chunk) {
+    if (!chunk) return;
+    const stream = $("#genStreamText");
+    const wrap = $("#genStreamWrap");
+    if (wrap) wrap.classList.remove("hidden");
+    if (stream) {
+      stream.textContent += chunk;
+      stream.scrollTop = stream.scrollHeight;
+    }
+    const stat = $("#genStreamStat");
+    if (stat && stream) stat.textContent = `${stream.textContent.length} 字符`;
+  }
+
+  async function generate() {
+    const body = buildChartBody();
+    if (!body.prompt && !body.data) {
       showHint("请至少输入需求或上传数据。", true);
       return;
     }
@@ -341,46 +542,40 @@
     }
     state.genController = new AbortController();
 
-    ensureChart(theme);
-    state.chart.showLoading({ text: "正在调用大模型…", color: "#5470c6" });
-    setChartStatus("正在调用大模型生成图表，可能需要 1–3 分钟…", true);
+    ensureChart(body.style_hint.theme);
+    state.chart.showLoading({ text: "正在生成图表…", color: "#5470c6" });
+    setChartStatus("正在调用大模型生成图表…", true);
+    setGenBusy(true);
+    resetGenPanel();
+    showGenPanel();
+    setStageStatus("prepare", "running", "进行中");
 
     try {
-      const body = {
-        prompt,
-        data: state.data || null,
-        chart_type_hint: typeHint || "",
-        style_hint: {
-          theme,
-          title,
-        },
-      };
-      const resp = await fetch("/api/chart", {
+      const resp = await fetch("/api/chart/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: state.genController.signal,
       });
-      const data = await resp.json();
-      state.chart.hideLoading();
-      setChartStatus("", false);
-
-      if (!resp.ok || data.error) {
-        showFallbackError(data.error || "生成失败");
-        showHint(data.error || "生成失败", true);
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        let msg = `生成失败 (HTTP ${resp.status})`;
+        try {
+          const j = JSON.parse(errText);
+          if (j.error) msg = j.error;
+        } catch (e) {}
+        state.chart.hideLoading();
+        hideChartStatus();
+        showHint(msg, true);
+        showFallbackError(msg);
         return;
       }
-
-      state.lastResp = data;
-      renderResponse(data);
-      let msg = `已生成图表：${data.chart_type} · ${data.type_reason || ""}`;
-      if (data.understanding) {
-        const u = data.understanding;
-        msg += u.method === "llm"
-          ? " · 🧠 已用 LLM 整理数据"
-          : " · ↩ 数据整理已回退到代码解析";
+      if (!resp.body || !resp.body.getReader) {
+        // 浏览器不支持流式读取：退回普通 JSON 接口
+        await generateFallback(state.genController.signal);
+        return;
       }
-      showHint(msg, false, true);
+      await consumeStream(resp.body, state.genController.signal);
     } catch (e) {
       state.chart.hideLoading();
       if (e.name === "AbortError") {
@@ -388,11 +583,222 @@
         showHint("已取消本次生成。", false, true);
         return;
       }
-      setChartStatus("", false);
+      hideChartStatus();
       showHint("请求失败：" + e.message, true);
     } finally {
       state.genController = null;
+      setGenBusy(false);
     }
+  }
+
+  // 浏览器不支持流式读取时，退回到原 /api/chart 一次性 JSON 接口
+  async function generateFallback(signal) {
+    const body = buildChartBody();
+    try {
+      const resp = await fetch("/api/chart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
+      const data = await resp.json();
+      state.chart.hideLoading();
+      hideChartStatus();
+      if (!resp.ok || data.error) {
+        showFallbackError(data.error || "生成失败");
+        showHint(data.error || "生成失败", true);
+        return;
+      }
+      // 一次性把整段 raw_reply 填进流式面板，让用户能事后看到
+      setStageStatus("prepare", "done");
+      setStageStatus("generate", "done");
+      setStageStatus("parse", "done");
+      appendStreamText(data.raw_reply || "");
+      state.lastResp = data;
+      renderResponse(data);
+      const elapsed = elapsedSinceStart();
+      showHint(`已生成图表：${data.chart_type}${elapsed ? " · 耗时 " + elapsed : ""}`, false, true);
+    } catch (e) {
+      state.chart.hideLoading();
+      hideChartStatus();
+      showHint("请求失败：" + e.message, true);
+    }
+  }
+
+  // 解析 SSE 流（data: {json}\n\n），逐事件回调
+  async function consumeStream(body, signal) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let lastEvt = null;
+    let doneResult = null;
+    let errored = false;
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // 按 SSE 规范以 "\n\n" 切分事件块
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const block = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const evt = parseSseBlock(block);
+          if (!evt) continue;
+          lastEvt = evt;
+          handleStreamEvent(evt, {
+            onDone: (d) => { doneResult = d; },
+            onError: () => { errored = true; },
+          });
+          if (errored || doneResult) break;
+        }
+        if (errored || doneResult) break;
+      }
+      // 流结束但还有尾巴数据
+      const tail = parseSseBlock(buffer);
+      if (tail) handleStreamEvent(tail, {
+        onDone: (d) => { doneResult = d; },
+        onError: () => { errored = true; },
+      });
+    } catch (e) {
+      state.chart.hideLoading();
+      if (e.name === "AbortError") throw e;
+      hideChartStatus();
+      showHint("读取流失败：" + e.message, true);
+      return;
+    }
+
+    state.chart.hideLoading();
+    hideChartStatus();
+
+    if (doneResult && !errored) {
+      state.lastResp = doneResult;
+      renderResponse(doneResult);
+      let msg = `已生成图表：${doneResult.chart_type} · ${doneResult.type_reason || ""}`;
+      if (doneResult.understanding) {
+        const u = doneResult.understanding;
+        if (u.method === "llm") msg += " · 🧠 已用 LLM 整理数据";
+        else if (u.method === "fallback") msg += " · ↩ 数据整理已回退";
+      }
+      if (doneResult.retried) msg += " · 🔁 已自动修正";
+      const elapsed = elapsedSinceStart();
+      if (elapsed) msg += ` · 耗时 ${elapsed}`;
+      showHint(msg, false, true);
+      setGenSub(`完成 · 图表类型 ${doneResult.chart_type}`);
+    } else if (!errored) {
+      // 流意外结束
+      const msg = (lastEvt && lastEvt.message) || "生成失败：连接中断";
+      showHint(msg, true);
+      showFallbackError(msg);
+    }
+  }
+
+  function parseSseBlock(block) {
+    if (!block) return null;
+    let data = null;
+    for (const line of block.split("\n")) {
+      if (line.startsWith("data:")) {
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        try { data = JSON.parse(payload); } catch (e) { /* skip */ }
+      }
+      // 忽略 event: / id: / retry: 等其它 SSE 字段
+    }
+    return data;
+  }
+
+  // -------- Stage detail templates ----------
+  // 每个阶段在不同 status 下显示什么细节。查表替代原来 60 行的 if/else 链。
+  const ICON_FOR = { running: "●", done: "✓", skipped: "—", error: "✕" };
+
+  const DETAIL_BY_STATUS = {
+    start: {
+      prepare:    () => "进行中…",
+      understand: () => "调用 LLM 整理数据中…",
+      preprocess: () => "解析需求中的数据处理指令…",
+      pick_type:  () => "调用 LLM 推荐图表类型…",
+      generate:   () => "等待模型输出…",
+      parse:      () => "解析 JSON…",
+    },
+    skipped: {
+      // 没识别到规则 / 数据用代码解析 / 用户没勾选 🧠
+      preprocess: () => "未识别到数据预处理指令",
+      understand: () => "未启用（数据用代码解析）",
+    },
+    error: () => (evt) => evt.message || "失败",
+    done: {
+      prepare:    () => "✓ 就绪",
+      understand: (evt) => {
+        const u = evt.understanding || {};
+        if (u.method === "llm") return u.reused ? "✓ LLM 已整理（解析阶段）" : "✓ LLM 已整理数据";
+        if (u.method === "fallback") return u.reused ? "↩ 解析阶段 LLM 整理失败" : "↩ 已回退到代码解析";
+        return "未启用";
+      },
+      preprocess: (evt) => {
+        const pp = evt.preprocess || {};
+        const applied = (pp.applied || []).filter((a) => a && !a.skipped);
+        return applied.length ? shortText(pp.summary || "已应用", 64) : "无匹配规则（已跳过）";
+      },
+      pick_type: (evt) => {
+        const reason = evt.reason ? " · " + shortText(evt.reason, 28) : "";
+        return `${evt.chart_type || ""}${reason}`;
+      },
+      generate: (evt) => `已生成 ${evt.length || 0} 字符`,
+      parse:    (evt) => (evt.retried ? "🔁 已自动修正" : "✓ 一次通过"),
+    },
+  };
+
+  function pickDetail(stage, status, evt) {
+    const table = DETAIL_BY_STATUS[status] || {};
+    let fn;
+    if (status === "error") {
+      // error 是顶层函数：适用于所有阶段
+      fn = table;
+    } else {
+      fn = table[stage];
+    }
+    return fn ? fn(evt || {}) : "已跳过";
+  }
+
+  function handleStreamEvent(evt, cbs) {
+    const t = evt.type;
+    if (t === "stage") {
+      const stage = evt.stage;
+      const status = evt.status;
+      const detail = pickDetail(stage, status, evt);
+
+      setStageStatus(stage, status, detail);
+      setGenSub(`${STAGE_LABELS[stage] || stage} · ${statusLabel(status)}`);
+
+      // 主生成阶段开始 → 立即展开流式输出区 + 打开输入光标
+      if (stage === "generate" && status === "start") {
+        showGenStream();
+        setGenStreamLive(true);
+      } else if (stage === "generate" && (status === "done" || status === "error")) {
+        setGenStreamLive(false);
+      }
+    } else if (t === "delta") {
+      appendStreamText(evt.content || "");
+    } else if (t === "done") {
+      cbs.onDone && cbs.onDone(evt);
+    } else if (t === "error") {
+      showHint(evt.message || "生成失败", true);
+      showFallbackError(evt.message || "生成失败");
+      cbs.onError && cbs.onError();
+      setGenStreamLive(false);
+    }
+  }
+
+  function statusLabel(s) {
+    return ({
+      start: "进行中…",
+      running: "进行中…",
+      done: "完成",
+      error: "出错",
+      skipped: "已跳过",
+    })[s] || s;
   }
 
   function cancelGeneration() {
@@ -402,7 +808,9 @@
     if (state.chart && state.chart.hideLoading) {
       state.chart.hideLoading();
     }
-    setChartStatus("", false);
+    hideChartStatus();
+    setGenBusy(false);
+    resetGenPanel();
     showHint("已取消本次生成。", false, true);
     setChartTitle("已取消");
   }
@@ -413,6 +821,7 @@
 
   function renderResponse(data) {
     try {
+      if (data.fn_map) data.option = restoreFunctions(data.option, data.fn_map);
       state.chart.setOption(data.option, true);
     } catch (e) {
       showFallbackError("图表 option 渲染失败：" + e.message);
@@ -425,6 +834,9 @@
       baseReason += ' <span class="understand-tag">🔁 已自动修正</span>';
     }
     reasonLine.innerHTML = baseReason;
+
+    // 拼接「理解 + 预处理」两块信息
+    const blocks = [];
     if (data.understanding) {
       const u = data.understanding;
       const tag = u.method === "llm"
@@ -433,7 +845,20 @@
       const parts = [tag + " " + (u.summary || "(无摘要)")];
       if (u.notes) parts.push("整理说明：" + u.notes);
       if (u.error) parts.push("（" + u.error + "）");
-      reasonUnd.innerHTML = parts.join("；");
+      blocks.push(parts.join("；"));
+    }
+    if (data.preprocess) {
+      const pp = data.preprocess;
+      const applied = (pp.applied || []).filter((a) => a && !a.skipped);
+      if (pp.rules && pp.rules.length && applied.length) {
+        const tag = '<span class="understand-tag">🔧 数据预处理</span>';
+        const items = applied.map((a) => a.action).filter(Boolean);
+        const summary = items.length ? items.join("；") : (pp.summary || "");
+        blocks.push(tag + " " + summary);
+      }
+    }
+    if (blocks.length) {
+      reasonUnd.innerHTML = blocks.join("&nbsp;&nbsp;·&nbsp;&nbsp;");
       reasonUnd.classList.remove("hidden");
     } else {
       reasonUnd.innerHTML = "";
@@ -455,7 +880,6 @@
     if (isError) el.classList.add("err");
     if (isOk) el.classList.add("ok");
   }
-  function hide(el) { el.classList.add("hidden"); }
 
   // -------- Tabs ----------
   document.querySelectorAll(".tab").forEach((tab) => {
@@ -469,11 +893,22 @@
     });
   });
 
-  // -------- Buttons ----------
+  // -------- Buttons & shortcuts ----------
   $("#btnParse").addEventListener("click", parseCurrent);
   $("#btnClearData").addEventListener("click", clearData);
   $("#btnGen").addEventListener("click", generate);
   $("#btnCancelGen").addEventListener("click", cancelGeneration);
+
+  // Ctrl/Cmd+Enter 在 prompt / 数据输入框里直接生成图表
+  document.addEventListener("keydown", (e) => {
+    const isSubmit = (e.ctrlKey || e.metaKey) && e.key === "Enter";
+    if (!isSubmit) return;
+    const t = e.target;
+    if (t && (t.tagName === "TEXTAREA" || (t.tagName === "INPUT" && t.type === "text"))) {
+      e.preventDefault();
+      if (!state.genController) generate();
+    }
+  });
   $("#btnSheetsAll").addEventListener("click", () => {
     document.querySelectorAll("#sheetList input[type=checkbox]").forEach((c) => (c.checked = true));
   });
@@ -756,4 +1191,5 @@ window.addEventListener('resize',()=>chart.resize());
   // On load
   initChart();
   initConfigModal();
+  initGenPanelCollapse();
 })();

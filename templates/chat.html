@@ -31,7 +31,7 @@
         <textarea id="textInput" rows="4" placeholder="也可直接粘贴 CSV / JSON / 文本数据…"></textarea>
         <label class="check-row" title="对不规范数据（多级表头、含单位、合计行、错位等）让大模型先整理">
           <input type="checkbox" id="useLlmChk" />
-          <span>🧠 用大模型智能整理（适合不规范数据）</span>
+          <span>🧠 用 LLM 智能整理数据（适合不规范数据）</span>
         </label>
         <label class="check-row" title="文件没有表头行：把第一行当数据，列名自动生成 字段1 / 字段2 / ...">
           <input type="checkbox" id="noHeaderChk" />
@@ -104,8 +104,15 @@
     </div>
 
     <div class="sidebar-bottom">
-      <div class="section-title">3. 发送需求</div>
+      <div class="section-title">
+        <span>3. 发送需求</span>
+        <span class="muted-small kbd-hint" title="在 prompt / 数据输入框内按 Ctrl+Enter 直接生成">Ctrl/⌘ + Enter</span>
+      </div>
       <textarea id="promptInput" rows="3" placeholder="例如：用数据里的「月份」作 X 轴，「销售额」作 Y 轴，生成柱状图并带圆角。"></textarea>
+      <label class="check-row" title="对不规范数据（多级表头、含单位、合计行等）让大模型先整理；解析阶段没勾 🧠 也能在这里补救">
+        <input type="checkbox" id="understandChk" />
+        <span>🧠 用 LLM 智能整理数据（生成时）</span>
+      </label>
       <div class="row">
         <button class="btn btn-primary" id="btnGen">✨ 生成图表</button>
         <button class="btn btn-ghost" id="btnSample">加载示例</button>
@@ -116,7 +123,14 @@
 
   <main class="main">
     <header class="main-head">
-      <div class="head-title">结果</div>
+      <div id="chartStatus" class="chart-status hidden" role="status" aria-live="polite">
+        <span class="dot-pulse"></span>
+        <span id="chartStatusText">准备中…</span>
+        <span id="chartStatusElapsed" class="muted-small"></span>
+        <span class="spacer"></span>
+        <button class="btn-cancel" id="btnCancelGen" type="button" title="取消本次生成">✕ 取消</button>
+        <div class="chart-status-progress" aria-hidden="true"></div>
+      </div>
       <div class="head-actions">
         <button class="btn btn-ghost" id="btnConfigOpen" title="模型与系统配置">⚙️ 配置</button>
         <button class="btn btn-ghost" id="btnExport">📥 导出代码</button>
@@ -126,15 +140,70 @@
 
     <section class="chart-area">
       <div id="chart" class="chart"></div>
-      <div id="chartStatus" class="chart-status hidden">
-        <span class="dot-pulse"></span>
-        <span id="chartStatusText">准备中…</span>
-        <span class="spacer"></span>
-        <button class="btn btn-ghost btn-mini" id="btnCancelGen" type="button" title="取消本次生成">✕ 取消</button>
-      </div>
     </section>
 
     <section class="reply-area">
+      <div id="genPanel" class="gen-panel hidden">
+        <div class="gen-panel-head" id="genPanelHead" role="button" tabindex="0" aria-expanded="true" aria-controls="genPanelBody" title="点击折叠 / 展开">
+          <span class="gen-panel-title">⚙️ 生成进度</span>
+          <span class="gen-panel-sub muted-small" id="genPanelSub">等待开始…</span>
+          <button class="gen-panel-toggle" id="genPanelToggle" type="button" aria-label="折叠" title="折叠 / 展开">▾</button>
+        </div>
+        <div class="gen-panel-body" id="genPanelBody">
+          <ol class="gen-stages" id="genStages">
+            <li class="gen-stage" data-stage="prepare">
+              <span class="gen-stage-icon">○</span>
+              <div class="gen-stage-body">
+                <div class="gen-stage-label">数据准备</div>
+                <div class="gen-stage-detail"></div>
+              </div>
+            </li>
+            <li class="gen-stage" data-stage="understand">
+              <span class="gen-stage-icon">○</span>
+              <div class="gen-stage-body">
+                <div class="gen-stage-label">智能数据整理</div>
+                <div class="gen-stage-detail"></div>
+              </div>
+            </li>
+            <li class="gen-stage" data-stage="preprocess">
+              <span class="gen-stage-icon">○</span>
+              <div class="gen-stage-body">
+                <div class="gen-stage-label">数据预处理</div>
+                <div class="gen-stage-detail"></div>
+              </div>
+            </li>
+            <li class="gen-stage" data-stage="pick_type">
+              <span class="gen-stage-icon">○</span>
+              <div class="gen-stage-body">
+                <div class="gen-stage-label">选择图表类型</div>
+                <div class="gen-stage-detail"></div>
+              </div>
+            </li>
+            <li class="gen-stage" data-stage="generate">
+              <span class="gen-stage-icon">○</span>
+              <div class="gen-stage-body">
+                <div class="gen-stage-label">生成图表配置</div>
+                <div class="gen-stage-detail"></div>
+              </div>
+            </li>
+            <li class="gen-stage" data-stage="parse">
+              <span class="gen-stage-icon">○</span>
+              <div class="gen-stage-body">
+                <div class="gen-stage-label">解析与校验</div>
+                <div class="gen-stage-detail"></div>
+              </div>
+            </li>
+          </ol>
+          <div class="gen-stream hidden" id="genStreamWrap">
+            <div class="gen-stream-head">
+              <span class="gen-stream-title">📝 模型实时输出</span>
+              <span class="gen-stream-stat muted-small" id="genStreamStat"></span>
+            </div>
+            <pre class="gen-stream-text" id="genStreamText"></pre>
+          </div>
+        </div>
+      </div>
+
       <div id="typeReason" class="reason hidden">
         <div class="reason-line"></div>
         <div class="reason-understanding hidden"></div>

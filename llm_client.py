@@ -69,6 +69,119 @@ def call_llm(
         raise RuntimeError(f"解析 LLM 响应失败：{e}; body={raw[:500]}")
 
 
+def call_llm_stream(
+    cfg: Dict[str, Any],
+    messages: List[Dict[str, str]],
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+):
+    """流式调用大模型，逐 chunk 产出 content。
+
+    设计要点：
+    - 走 OpenAI 兼容协议，请求时带 ``stream: true``，要求 ``text/event-stream``。
+    - 按 SSE 规范解析 ``data: {json}`` 增量行，遇到 ``data: [DONE]`` 结束。
+    - 如果服务端直接返回 ``application/json``（不支持流式），自动降级为一次性 yield 全部内容。
+    - 与 ``call_llm`` 错误处理对齐：HTTP 错误抛 ``RuntimeError``，由调用方决定回退。
+
+    Yields:
+        str: 每次产出的 content delta（可能是空字符串，调用方需自行过滤）。
+    """
+    base_url = (cfg.get("base_url") or "").rstrip("/")
+    api_key = cfg.get("api_key") or ""
+    model = cfg.get("model") or ""
+    if not base_url or not api_key or not model:
+        raise RuntimeError("LLM 配置不完整：需要 Base URL、API Key、Model。")
+    endpoint = f"{base_url}/chat/completions"
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+    }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    ctx = ssl.create_default_context()
+    try:
+        resp = urllib.request.urlopen(req, timeout=300, context=ctx)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"LLM 服务 HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')[:500]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"无法连接 LLM 服务：{e}")
+
+    content_type = (resp.headers.get("Content-Type") or "").lower()
+    if "text/event-stream" not in content_type:
+        # 服务端未走 SSE：当成一次性 JSON，把全部 content 作为单 chunk yield
+        raw_text = ""
+        try:
+            raw_text = resp.read().decode("utf-8", errors="replace")
+            obj = json.loads(raw_text)
+        except Exception as e:
+            raise RuntimeError(f"LLM 返回不是合法 JSON：{e}; body={raw_text[:500]}")
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        msg = (obj.get("choices") or [{}])[0].get("message") or {}
+        text = msg.get("content") or ""
+        if not text and isinstance(obj.get("content"), list):
+            text = "".join((c.get("text") or "") for c in obj["content"])
+        if not text and isinstance(obj.get("content"), str):
+            text = obj["content"]
+        if text:
+            yield text
+        return
+
+    # 真正的 SSE 路径
+    try:
+        for raw_line in resp:
+            try:
+                line = raw_line.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            if not line:
+                continue
+            # SSE 行以 "data: " 开头；忽略 ":..." 注释行和事件名行
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                if data == "[DONE]":
+                    break
+                continue
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            if content:
+                yield content
+            # 部分实现在最后一个 chunk 把 finish_reason 放进 delta；这里不专门处理
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
 def pick_chart_type(
     cfg: Dict[str, Any],
     prompt: str,

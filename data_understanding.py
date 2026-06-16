@@ -17,6 +17,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from llm_client import call_llm
+from data_parser import _decode_text
 
 
 SYSTEM_PROMPT = """你是一名资深的数据整理助手，擅长把不规范的真实数据整理成规范的表格。
@@ -85,6 +86,46 @@ MAX_TOKENS = 2048
 
 # ----------------------------- JSON 抽取与校验 -----------------------------
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(\{[\s\S]+?\})\s*```", re.IGNORECASE)
+_TRAILING_COMMA = re.compile(r",\s*([}\]])")
+# 候选 JSON 体积上限：超过即放弃（防 LLM 异常输出巨大字符串时拖累 json.loads）。
+_MAX_JSON_CANDIDATE = 500_000
+
+
+def _scan_json_object(raw: str, max_size: int = _MAX_JSON_CANDIDATE) -> Optional[str]:
+    """栈式扫描 raw 中**第一个完整顶层 JSON 对象**。
+
+    比 ``raw.find("{") + raw.rfind("}")`` 切片更窄 —— 不会把后续解释/噪声一起包进来。
+    候选超过 ``max_size`` 直接返回 ``None``。
+    """
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    n = len(raw)
+    for i in range(start, n):
+        c = raw[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                if end - start > max_size:
+                    return None
+                return raw[start:end]
+    return None
 
 
 def _extract_json(raw: str) -> Optional[dict]:
@@ -92,19 +133,16 @@ def _extract_json(raw: str) -> Optional[dict]:
     if not raw:
         return None
     m = _JSON_FENCE.search(raw)
-    candidate = m.group(1) if m else None
+    candidate: Optional[str] = m.group(1) if m else None
     if not candidate:
-        first = raw.find("{")
-        last = raw.rfind("}")
-        if first >= 0 and last > first:
-            candidate = raw[first : last + 1]
+        candidate = _scan_json_object(raw)
     if not candidate:
         return None
     try:
         obj = json.loads(candidate)
     except Exception:
         # 尝试去掉尾随逗号等常见错误
-        cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+        cleaned = _TRAILING_COMMA.sub(r"\1", candidate)
         try:
             obj = json.loads(cleaned)
         except Exception:
@@ -259,7 +297,7 @@ def build_raw_preview(
 ) -> str:
     """为 LLM 准备一段「原始数据片段」。优先用 raw_bytes，否则用代码解析草稿重建。"""
     if raw_bytes is not None:
-        text = _try_decode(raw_bytes)
+        text = _decode_text(raw_bytes)
         if text:
             return text[:MAX_RAW_CHARS]
 
@@ -272,15 +310,6 @@ def build_raw_preview(
     for r in sample:
         lines.append(",".join([str(r.get(c, "")) for c in cols]))
     return ("\n".join(lines))[:MAX_RAW_CHARS]
-
-
-def _try_decode(raw: bytes) -> str:
-    for enc in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
 
 
 def understand_data(
