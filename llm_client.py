@@ -136,6 +136,7 @@ class ChatOpenAIWrapper:
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
                 "streaming": stream,
+                "timeout": 120,
                 **overrides,
             }
             return ChatOpenAI(**kwargs)
@@ -262,9 +263,7 @@ class ChatOpenAIWrapper:
 
         llm = self._build_llm(stream=True)
 
-        # 用 .bind() 绑定所有运行时参数
         bind_kwargs: Dict[str, Any] = {"max_tokens": max_t, "temperature": temp}
-        # response_format 只对 OpenAI 兼容 provider 有效；Ollama / GLM 等不支持 json_schema 格式，跳过以避免 502
         if response_format is not None and self.provider not in ("ollama", "glm"):
             bind_kwargs["response_format"] = response_format
         extra_body = resolve_extra_kwargs(
@@ -274,11 +273,14 @@ class ChatOpenAIWrapper:
             bind_kwargs["extra_body"] = extra_body
 
         bound_llm = llm.bind(**bind_kwargs)
-        for event in bound_llm.stream(langchain_messages):
-            if isinstance(event, AIMessage):
-                content = event.content or ""
-                if content:
-                    yield content
+        try:
+            for event in bound_llm.stream(langchain_messages):
+                if isinstance(event, AIMessage):
+                    content = event.content or ""
+                    if content:
+                        yield content
+        except Exception as e:
+            raise RuntimeError(f"LLM 流式调用失败：{e}") from e
 
     @property
     def llm(self) -> ChatOpenAI:

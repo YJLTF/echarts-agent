@@ -611,20 +611,21 @@ def api_chart_stream():
         try:
             for evt in run_chart_pipeline(cfg, prompt, data, chart_type_hint, style_hint, stream=True):
                 yield _sse_format_event(evt)
-                # 确保每个事件立即刷新到客户端
         except Exception as e:
-            # 兜底：pipeline 自己已经在出错位置 emit 过 error；这里再补一发以防外层异常
             yield _sse_format_event({"type": "error", "message": f"生成失败：{e}"})
 
-    return Response(
+    resp = Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
+    # 阻止响应被提前关闭：Flask 开发服务器在长时间生成器执行时可能主动断开
+    resp.call_on_close(lambda: None)
+    return resp
 
 
 def _sse_format_event(obj: dict) -> str:
@@ -808,18 +809,39 @@ def run_chart_pipeline(
     raw = ""
     try:
         if stream:
-            for chunk in call_llm_stream(
+            # 用内层 try-catch 确保流式调用中出现异常时不会中断整个生成器
+            # 任何在流式调用中抛的异常都会在这里捕获，yield 错误事件然后 return
+            stream_iter = call_llm_stream(
                 cfg,
                 messages=messages,
                 max_tokens=cfg["max_tokens"],
                 temperature=cfg["temperature"],
                 response_format=_CHART_RESPONSE_SCHEMA,
                 reasoning_effort=cfg.get("reasoning_effort") or None,
-            ):
+            )
+            while True:
+                try:
+                    chunk = next(stream_iter)
+                except StopIteration:
+                    break
+                except Exception as inner_e:
+                    # LLM 流式调用中途失败 —— 转化为错误事件
+                    yield {
+                        "type": "stage",
+                        "stage": "generate",
+                        "status": "error",
+                        "message": str(inner_e),
+                    }
+                    yield {
+                        "type": "error",
+                        "message": f"模型流式调用失败：{inner_e}",
+                        "raw_reply": raw,
+                        "status": 500,
+                    }
+                    return
                 raw += chunk
                 if chunk:
                     yield {"type": "delta", "content": chunk}
-            # 流式拿不到 reasoning 字段（增量 chunk 里 reasoning 不被解析），置空
             reasoning = ""
         else:
             raw, reasoning = call_llm_raw(
@@ -830,7 +852,6 @@ def run_chart_pipeline(
                 response_format=_CHART_RESPONSE_SCHEMA,
                 reasoning_effort=cfg.get("reasoning_effort") or None,
             )
-            # 把 reasoning 拼到 raw_reply 头部，让用户能在「原始回复」tab 看到思考过程
             if reasoning:
                 raw = f"<think>\n{reasoning}\n</think>\n\n{raw}"
     except Exception as e:
