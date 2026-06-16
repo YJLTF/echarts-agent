@@ -625,6 +625,8 @@ def api_chart_stream():
 
         data: {"type":"error", "message":"..."}\\n\\n
     """
+    from flask import stream_with_context
+
     prompt, data, chart_type_hint, style_hint = _parse_chart_request()
 
     cfg = build_llm_cfg()
@@ -633,20 +635,19 @@ def api_chart_stream():
         try:
             for evt in run_chart_pipeline(cfg, prompt, data, chart_type_hint, style_hint, stream=True):
                 yield _sse_format_event(evt)
+                # 确保每个事件立即刷新到客户端
         except Exception as e:
             # 兜底：pipeline 自己已经在出错位置 emit 过 error；这里再补一发以防外层异常
             yield _sse_format_event({"type": "error", "message": f"生成失败：{e}"})
 
     return Response(
-        generate(),
-        content_type="text/event-stream; charset=utf-8",
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
         headers={
-            "Cache-Control": "no-cache, no-transform",
+            "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
-            "Transfer-Encoding": "chunked",
         },
-        direct_passthrough=False,
     )
 
 
