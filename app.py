@@ -43,7 +43,7 @@ app = Flask(
 )
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "echarts-agent-secret")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
-CORS(app)
+CORS(app, supports_credentials=True, expose_headers=["Content-Type"])
 
 
 # ---------------------- Database ----------------------
@@ -545,6 +545,26 @@ def api_knowledge():
     return jsonify(result)
 
 
+@app.route("/api/chart/test", methods=["POST"])
+@config_required
+def api_chart_test():
+    """测试用非流式接口：直接调用 LLM 返回结果，用于调试。"""
+    body = request.get_json(force=True) or {}
+    prompt = body.get("prompt", "")
+    cfg = build_llm_cfg()
+    
+    from llm_client import call_llm
+    try:
+        messages = [
+            {"role": "system", "content": cfg.get("system_prompt", "") or "你是一个数据可视化助手。"},
+            {"role": "user", "content": prompt}
+        ]
+        result = call_llm(cfg, messages, max_tokens=500, temperature=0.7)
+        return jsonify({"ok": True, "result": result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/chart", methods=["POST"])
 @config_required
 def api_chart():
@@ -630,9 +650,10 @@ def api_chart_stream():
     )
 
 
-def _sse_format_event(obj: dict) -> bytes:
-    """把一个事件 dict 格式化为 SSE 单行 bytes：``data: {json}\\n\\n``。"""
-    return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+def _sse_format_event(obj: dict) -> str:
+    """把一个事件 dict 格式化为 SSE 单行：``data: {json}\\n\\n``。"""
+    line = "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+    return line
 
 
 # ---------------------- Chart Generation Pipeline ----------------------

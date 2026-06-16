@@ -534,31 +534,8 @@
     setStageStatus("prepare", "running", "进行中");
 
     try {
-      const resp = await fetch("/api/chart/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: state.genController.signal,
-      });
-      if (!resp.ok) {
-        const errText = await resp.text().catch(() => "");
-        let msg = `生成失败 (HTTP ${resp.status})`;
-        try {
-          const j = JSON.parse(errText);
-          if (j.error) msg = j.error;
-        } catch (e) {}
-        state.chart.hideLoading();
-        hideChartStatus();
-        showHint(msg, true);
-        showFallbackError(msg);
-        return;
-      }
-      if (!resp.body || !resp.body.getReader) {
-        // 浏览器不支持流式读取：退回普通 JSON 接口
-        await generateFallback(state.genController.signal);
-        return;
-      }
-      await consumeStream(resp.body, state.genController.signal);
+      // 暂时使用非流式接口以避免流式传输问题
+      await generateFallback(state.genController.signal);
     } catch (e) {
       state.chart.hideLoading();
       if (e.name === "AbortError") {
