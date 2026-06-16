@@ -657,6 +657,29 @@
         }
       };
       xhr.onerror = () => {
+        // 流式响应中，连接关闭可能触发 onerror 而非 onload
+        // 如果已经收到 done/error 事件，说明数据完整，按正常处理
+        if (done || errored) {
+          state.chart.hideLoading();
+          hideChartStatus();
+          if (done && !errored) {
+            state.lastResp = done;
+            renderResponse(done);
+            let msg = `已生成图表：${done.chart_type} · ${done.type_reason || ""}`;
+            if (done.understanding) {
+              const u = done.understanding;
+              if (u.method === "llm") msg += " · 🧠 已用 LLM 整理数据";
+              else if (u.method === "fallback") msg += " · ↩ 数据整理已回退";
+            }
+            const elapsed = elapsedSinceStart();
+            if (elapsed) msg += ` · 耗时 ${elapsed}`;
+            showHint(msg, false, true);
+            setGenSub(`完成 · 图表类型 ${done.chart_type}`);
+          }
+          finish(() => resolve({ ok: !!done && !errored, errorMessage: errored ? ((lastEvt && lastEvt.message) || "生成失败") : undefined }));
+          return;
+        }
+        // 真正的网络错误：没有收到任何 done/error
         state.chart.hideLoading();
         hideChartStatus();
         const msg = "读取流失败：网络错误";
