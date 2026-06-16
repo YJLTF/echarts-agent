@@ -8,10 +8,6 @@ from datetime import datetime, timezone
 from functools import wraps
 from typing import Optional
 
-# 清除 LLM wrapper 缓存，确保每次使用最新配置
-import llm_client
-llm_client._llm_wrapper_cache.clear()
-
 from flask import (
     Flask,
     Response,
@@ -43,7 +39,7 @@ app = Flask(
 )
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "echarts-agent-secret")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
-CORS(app, supports_credentials=True, expose_headers=["Content-Type"])
+CORS(app)
 
 
 # ---------------------- Database ----------------------
@@ -543,26 +539,6 @@ def api_knowledge():
     else:
         result = search_knowledge(q)
     return jsonify(result)
-
-
-@app.route("/api/chart/test", methods=["POST"])
-@config_required
-def api_chart_test():
-    """测试用非流式接口：直接调用 LLM 返回结果，用于调试。"""
-    body = request.get_json(force=True) or {}
-    prompt = body.get("prompt", "")
-    cfg = build_llm_cfg()
-    
-    from llm_client import call_llm
-    try:
-        messages = [
-            {"role": "system", "content": cfg.get("system_prompt", "") or "你是一个数据可视化助手。"},
-            {"role": "user", "content": prompt}
-        ]
-        result = call_llm(cfg, messages, max_tokens=500, temperature=0.7)
-        return jsonify({"ok": True, "result": result})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/chart", methods=["POST"])
