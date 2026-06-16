@@ -205,7 +205,7 @@ class ChatOpenAIWrapper:
         )
 
         # 构建 chat messages
-        from langchain_core.messages import HumanMessage, SystemMessage
+        from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
         langchain_messages: List[BaseMessage] = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -241,7 +241,7 @@ class ChatOpenAIWrapper:
         max_t = max_tokens if max_tokens is not None else self.max_tokens
         temp = temperature if temperature is not None else self.temperature
 
-        from langchain_core.messages import HumanMessage, SystemMessage
+        from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
         langchain_messages: List[BaseMessage] = []
         for msg in messages:
             role = msg.get("role", "user")
