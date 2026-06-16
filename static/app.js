@@ -549,7 +549,13 @@
       if (!result.ok) {
         state.chart.hideLoading();
         hideChartStatus();
-        showHint(result.errorMessage || "生成失败", true);
+        // 在错误消息里附带诊断信息
+        let diag = "";
+        if (result.diag) {
+          diag = ` [${result.diag}]`;
+        }
+        const errMsg = (result.errorMessage || "生成失败") + diag;
+        showHint(errMsg, true);
         showFallbackError(result.errorMessage || "生成失败");
         return;
       }
@@ -612,8 +618,15 @@
           pending = p;
         }
         state._tail = pending;
+        // 诊断：实时打印进度到控制台（便于排查）
+        if (window.console && window.console.log && !done) {
+          if (buffer.length % 5000 < newBytes.length) {
+            console.log(`[stream] 已接收 ${buffer.length} 字符, done=${!!done}, errored=${errored}`);
+          }
+        }
       };
       xhr.onload = () => {
+        console.log("[stream] onload 触发, 接收总字符:", buffer.length, "done:", !!done, "errored:", errored);
         // 把可能的最后一段 tail 处理掉
         if (state._tail && state._tail.trim()) {
           const evt = parseSseBlock(state._tail);
@@ -656,7 +669,9 @@
           finish(() => resolve({ ok: false, errorMessage: (lastEvt && lastEvt.message) || "生成失败" }));
         }
       };
-      xhr.onerror = () => {
+      xhr.onerror = (ev) => {
+        // 诊断日志
+        console.error("[stream] onerror 触发, 已接收:", buffer.length, "字符, done:", !!done, "errored:", errored, "xhr.status:", xhr.status, "xhr.readyState:", xhr.readyState, "event:", ev);
         // 流式响应中，连接关闭可能触发 onerror 而非 onload
         // 如果已经收到 done/error 事件，说明数据完整，按正常处理
         if (done || errored) {
@@ -683,8 +698,21 @@
         state.chart.hideLoading();
         hideChartStatus();
         const msg = "读取流失败：网络错误";
-        showHint(msg, true);
-        finish(() => resolve({ ok: false, errorMessage: msg }));
+        const diag = `已接收 ${buffer.length} 字符 · status=${xhr.status} · readyState=${xhr.readyState}`;
+        showHint(msg + " " + diag, true);
+        finish(() => resolve({ ok: false, errorMessage: msg, diag }));
+      };
+      xhr.ontimeout = () => {
+        console.error("[stream] ontimeout 触发");
+        if (done || errored) {
+          return;
+        }
+        state.chart.hideLoading();
+        hideChartStatus();
+        const msg = "生成超时";
+        const diag = `已接收 ${buffer.length} 字符`;
+        showHint(msg + " " + diag, true);
+        finish(() => resolve({ ok: false, errorMessage: msg, diag }));
       };
       xhr.onabort = () => {
         state.chart.hideLoading();
