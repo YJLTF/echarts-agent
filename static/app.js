@@ -533,32 +533,26 @@
     showGenPanel();
     setStageStatus("prepare", "running", "进行中");
 
+    // 优先用 XMLHttpRequest 处理流式，它在各种代理/浏览器下比 fetch 更稳；
+    // 若浏览器异常无法 XHR 再退回 fetch。
+    const cancelled = { v: false };
+    const onCancel = () => { cancelled.v = true; try { xhr.abort(); } catch (e) {} };
+    state.genController.signal.addEventListener("abort", onCancel);
+
+    let xhr = null;
     try {
-      const resp = await fetch("/api/chart/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: state.genController.signal,
-      });
-      if (!resp.ok) {
-        const errText = await resp.text().catch(() => "");
-        let msg = `生成失败 (HTTP ${resp.status})`;
-        try {
-          const j = JSON.parse(errText);
-          if (j.error) msg = j.error;
-        } catch (e) {}
+      const result = await requestStreamXhr(
+        "/api/chart/stream",
+        JSON.stringify(body),
+        () => cancelled.v
+      );
+      if (!result.ok) {
         state.chart.hideLoading();
         hideChartStatus();
-        showHint(msg, true);
-        showFallbackError(msg);
+        showHint(result.errorMessage || "生成失败", true);
+        showFallbackError(result.errorMessage || "生成失败");
         return;
       }
-      if (!resp.body || !resp.body.getReader) {
-        // 浏览器不支持流式读取：退回普通 JSON 接口
-        await generateFallback(state.genController.signal);
-        return;
-      }
-      await consumeStream(resp.body, state.genController.signal);
     } catch (e) {
       state.chart.hideLoading();
       if (e.name === "AbortError") {
@@ -572,6 +566,115 @@
       state.genController = null;
       setGenBusy(false);
     }
+  }
+
+  // 用 XMLHttpRequest 处理 SSE 流：按 "\n\n" 切片 + JSON.parse
+  // 返回 Promise<{ ok, errorMessage? }>
+  function requestStreamXhr(url, bodyStr, isCancelled) {
+    return new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      let buffer = "";
+      let done = null;
+      let errored = false;
+      let lastEvt = null;
+      let finished = false;
+
+      const finish = (finalize) => {
+        if (finished) return;
+        finished = true;
+        finalize();
+      };
+
+      xhr.open("POST", url, true);
+      xhr.setRequestHeader("Content-Type", "application/json");
+      // 让浏览器不要等整个响应完，onprogress 一边来一边触发
+      xhr.onprogress = () => {
+        if (!xhr.responseText) return;
+        const slice = xhr.responseText;
+        if (slice.length <= buffer.length) return;
+        const newBytes = slice.slice(buffer.length);
+        buffer = slice;
+        // 按 "\n\n" 拆分出多个事件块
+        let idx;
+        const pieces = newBytes.split("\n\n");
+        // 第一块可能承接上次的尾巴，合并到 bufferTail
+        let pending = (state._tail || "") + pieces.shift();
+        // 剩余完整块直接处理
+        for (const p of pieces) {
+          if (done || errored) break;
+          const evt = parseSseBlock(pending);
+          if (evt) {
+            lastEvt = evt;
+            if (evt.type === "done") done = evt;
+            else if (evt.type === "error") errored = true;
+            handleStreamEvent(evt);
+          }
+          pending = p;
+        }
+        state._tail = pending;
+      };
+      xhr.onload = () => {
+        // 把可能的最后一段 tail 处理掉
+        if (state._tail && state._tail.trim()) {
+          const evt = parseSseBlock(state._tail);
+          if (evt) {
+            lastEvt = evt;
+            if (evt.type === "done") done = evt;
+            else if (evt.type === "error") errored = true;
+            handleStreamEvent(evt);
+          }
+        }
+        state._tail = "";
+        state.chart.hideLoading();
+        hideChartStatus();
+
+        if (done && !errored) {
+          state.lastResp = done;
+          renderResponse(done);
+          let msg = `已生成图表：${done.chart_type} · ${done.type_reason || ""}`;
+          if (done.understanding) {
+            const u = done.understanding;
+            if (u.method === "llm") msg += " · 🧠 已用 LLM 整理数据";
+            else if (u.method === "fallback") msg += " · ↩ 数据整理已回退";
+          }
+          const elapsed = elapsedSinceStart();
+          if (elapsed) msg += ` · 耗时 ${elapsed}`;
+          showHint(msg, false, true);
+          setGenSub(`完成 · 图表类型 ${done.chart_type}`);
+          finish(() => resolve({ ok: true }));
+        } else if (xhr.status >= 400) {
+          const msg = `生成失败 (HTTP ${xhr.status})`;
+          showFallbackError(msg);
+          showHint(msg, true);
+          finish(() => resolve({ ok: false, errorMessage: msg }));
+        } else if (!errored) {
+          const msg = (lastEvt && lastEvt.message) || "生成失败：连接中断";
+          showHint(msg, true);
+          showFallbackError(msg);
+          finish(() => resolve({ ok: false, errorMessage: msg }));
+        } else {
+          finish(() => resolve({ ok: false, errorMessage: (lastEvt && lastEvt.message) || "生成失败" }));
+        }
+      };
+      xhr.onerror = () => {
+        state.chart.hideLoading();
+        hideChartStatus();
+        const msg = "读取流失败：网络错误";
+        showHint(msg, true);
+        finish(() => resolve({ ok: false, errorMessage: msg }));
+      };
+      xhr.onabort = () => {
+        state.chart.hideLoading();
+        hideChartStatus();
+        finish(() => resolve({ ok: false, errorMessage: "已取消", aborted: true }));
+      };
+
+      try {
+        xhr.send(bodyStr);
+      } catch (e) {
+        finish(() => resolve({ ok: false, errorMessage: e.message }));
+      }
+    });
   }
 
   // 浏览器不支持流式读取时，退回到原 /api/chart 一次性 JSON 接口

@@ -4,6 +4,8 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Optional
@@ -591,47 +593,112 @@ def _parse_chart_request() -> tuple[str, object, str, dict]:
 def api_chart_stream():
     """流式（SSE）接口：边生成边把阶段事件与模型输出 token 推给前端。
 
-    协议：``text/event-stream``，每条事件一行::
-
-        data: {"type":"stage", ...}\\n\\n
-        data: {"type":"delta","content":"..."}\\n\\n
-        data: {"type":"done", "chart_type":..., "option":..., ...}\\n\\n
-
-    失败事件::
-
-        data: {"type":"error", "message":"..."}\\n\\n
+    - 生成器全程用 ``yield`` 推送，每产生一个事件立即 flush，避免被中间代理/
+      服务器缓冲；
+    - 内置心跳（heartbeat）事件：每 8 秒若还没有真实事件产出，则发一个空
+      ``: heartbeat`` 注释事件，让代理与浏览器知道连接仍活跃；
+    - 所有异常都被包住 → 以 ``{"type":"error"}`` 事件正常结束流，而不是
+      让底层抛出异常把 TCP 连接打断，避免前端报 "读取流失败"。
     """
-    from flask import stream_with_context
-
     prompt, data, chart_type_hint, style_hint = _parse_chart_request()
-
     cfg = build_llm_cfg()
 
-    def generate():
+    # 共享状态：pipeline_events 队列 + 终止信号
+    pipeline_events: list = []
+    finished = threading.Event()
+    errored = threading.Event()
+    lock = threading.Lock()
+
+    def producer():
         try:
-            for evt in run_chart_pipeline(cfg, prompt, data, chart_type_hint, style_hint, stream=True):
-                yield _sse_format_event(evt)
+            for evt in run_chart_pipeline(
+                cfg, prompt, data, chart_type_hint, style_hint, stream=True
+            ):
+                with lock:
+                    pipeline_events.append(evt)
+                # 让消费者尽快看到（不做全局 sleep 也行，消费者里有短轮询）
         except Exception as e:
-            yield _sse_format_event({"type": "error", "message": f"生成失败：{e}"})
+            with lock:
+                pipeline_events.append(
+                    {"type": "error", "message": f"生成失败：{e}"}
+                )
+            errored.set()
+        finally:
+            finished.set()
+
+    # 后台线程跑 pipeline，主线程负责 yield 给 Flask
+    t = threading.Thread(target=producer, daemon=True)
+    t.start()
+
+    def generate():
+        last_evt_at = time.time()
+        sent_done_or_error = False
+        # 先推一条空事件，让中间代理/浏览器建立流状态
+        yield ": ok\n\n"
+        try:
+            while True:
+                # 1) 先把所有已产出事件立刻推出去
+                while True:
+                    with lock:
+                        if not pipeline_events:
+                            break
+                        evt = pipeline_events.pop(0)
+                    yield _sse_format_event(evt)
+                    last_evt_at = time.time()
+                    if evt.get("type") in ("done", "error"):
+                        sent_done_or_error = True
+                        break
+
+                if sent_done_or_error:
+                    break
+
+                # 2) pipeline 已自然结束但没产出 done / error → 兜底
+                if finished.is_set():
+                    with lock:
+                        remaining = list(pipeline_events)
+                        pipeline_events.clear()
+                    for evt in remaining:
+                        yield _sse_format_event(evt)
+                        if evt.get("type") in ("done", "error"):
+                            sent_done_or_error = True
+                            break
+                    if not sent_done_or_error:
+                        yield _sse_format_event(
+                            {"type": "error", "message": "生成失败：服务端异常中断"}
+                        )
+                    break
+
+                # 3) 心跳：超过 8 秒没有任何事件，发一行注释保持连接
+                now = time.time()
+                if now - last_evt_at > 8:
+                    yield ": heartbeat\n\n"
+                    last_evt_at = now
+                    continue
+
+                # 4) 短轮询：避免 busy loop，又不至于延迟太大
+                time.sleep(0.05)
+        finally:
+            # 确保后台线程被等一下（它已经 daemon，进程退出也会被回收）
+            pass
 
     resp = Response(
-        stream_with_context(generate()),
+        generate(),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
+            "X-Powered-By": "echarts-agent",
         },
     )
-    # 阻止响应被提前关闭：Flask 开发服务器在长时间生成器执行时可能主动断开
-    resp.call_on_close(lambda: None)
+    # waitress / Flask: 每一次 yield 都立刻 flush，不要被 WSGI 缓冲
+    resp.direct_passthrough = True
     return resp
 
 
 def _sse_format_event(obj: dict) -> str:
-    """把一个事件 dict 格式化为 SSE 单行：``data: {json}\\n\\n``。"""
-    line = "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
-    return line
+    """把一个事件 dict 格式化为 SSE 帧：``data: {json}\\n\\n``。"""
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
 
 # ---------------------- Chart Generation Pipeline ----------------------
@@ -981,6 +1048,23 @@ def wrap_code(option: dict, llm_code: Optional[str], chart_type: str) -> str:
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", "8080"))
-    print(f"[ECharts Agent] starting on http://localhost:{port}")
-    # threaded=True：长 LLM 请求不会阻塞其他用户/标签页
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    host = os.environ.get("HOST", "0.0.0.0")
+    print(f"[ECharts Agent] starting on http://{host}:{port}")
+
+    # 优先用 waitress（生产级 WSGI，流式响应不会被开发服务器缓冲）；
+    # 若 waitress 未安装则退回 Flask 开发服务器 + threaded=True，确保流式能跑。
+    try:
+        from waitress import serve
+
+        print(f"[ECharts Agent] using waitress (WSGI)")
+        serve(
+            app,
+            host=host,
+            port=port,
+            threads=8,
+            # waitress 内部会把 write() 立刻 flush，不用额外 backlog 设置
+            channel_timeout=300,  # 允许一次请求最多跑 5 分钟（大模型流式）
+        )
+    except Exception as e:
+        print(f"[ECharts Agent] waitress 不可用（{e}），退回 Flask 开发服务器")
+        app.run(host=host, port=port, debug=False, threaded=True)
