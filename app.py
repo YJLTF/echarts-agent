@@ -603,83 +603,31 @@ def api_chart_stream():
     prompt, data, chart_type_hint, style_hint = _parse_chart_request()
     cfg = build_llm_cfg()
 
-    # 共享状态：pipeline_events 队列 + 终止信号
-    pipeline_events: list = []
-    finished = threading.Event()
-    errored = threading.Event()
-    lock = threading.Lock()
-
-    def producer():
+    def generate():
+        # 先推一条注释，让代理/浏览器建立流状态
+        yield ": ok\n\n"
+        last_evt_at = time.time()
         try:
             for evt in run_chart_pipeline(
                 cfg, prompt, data, chart_type_hint, style_hint, stream=True
             ):
-                with lock:
-                    pipeline_events.append(evt)
-                # 让消费者尽快看到（不做全局 sleep 也行，消费者里有短轮询）
+                yield _sse_format_event(evt)
+                last_evt_at = time.time()
+                if evt.get("type") in ("done", "error"):
+                    return
         except Exception as e:
-            with lock:
-                pipeline_events.append(
-                    {"type": "error", "message": f"生成失败：{e}"}
-                )
-            errored.set()
-        finally:
-            finished.set()
+            # pipeline 生成器自身抛异常（不应发生，但兜底）
+            import traceback
+            traceback.print_exc()
+            yield _sse_format_event(
+                {"type": "error", "message": f"生成失败：{e}"}
+            )
+            return
 
-    # 后台线程跑 pipeline，主线程负责 yield 给 Flask
-    t = threading.Thread(target=producer, daemon=True)
-    t.start()
-
-    def generate():
-        last_evt_at = time.time()
-        sent_done_or_error = False
-        # 先推一条空事件，让中间代理/浏览器建立流状态
-        yield ": ok\n\n"
-        try:
-            while True:
-                # 1) 先把所有已产出事件立刻推出去
-                while True:
-                    with lock:
-                        if not pipeline_events:
-                            break
-                        evt = pipeline_events.pop(0)
-                    yield _sse_format_event(evt)
-                    last_evt_at = time.time()
-                    if evt.get("type") in ("done", "error"):
-                        sent_done_or_error = True
-                        break
-
-                if sent_done_or_error:
-                    break
-
-                # 2) pipeline 已自然结束但没产出 done / error → 兜底
-                if finished.is_set():
-                    with lock:
-                        remaining = list(pipeline_events)
-                        pipeline_events.clear()
-                    for evt in remaining:
-                        yield _sse_format_event(evt)
-                        if evt.get("type") in ("done", "error"):
-                            sent_done_or_error = True
-                            break
-                    if not sent_done_or_error:
-                        yield _sse_format_event(
-                            {"type": "error", "message": "生成失败：服务端异常中断"}
-                        )
-                    break
-
-                # 3) 心跳：超过 8 秒没有任何事件，发一行注释保持连接
-                now = time.time()
-                if now - last_evt_at > 8:
-                    yield ": heartbeat\n\n"
-                    last_evt_at = now
-                    continue
-
-                # 4) 短轮询：避免 busy loop，又不至于延迟太大
-                time.sleep(0.05)
-        finally:
-            # 确保后台线程被等一下（它已经 daemon，进程退出也会被回收）
-            pass
+        # pipeline 正常结束但没产出 done/error → 兜底
+        yield _sse_format_event(
+            {"type": "error", "message": "生成失败：服务端异常中断"}
+        )
 
     resp = Response(
         generate(),
@@ -687,7 +635,6 @@ def api_chart_stream():
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
-            "X-Powered-By": "echarts-agent",
         },
     )
     return resp
