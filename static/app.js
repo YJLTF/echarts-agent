@@ -540,25 +540,13 @@
     state.genController.signal.addEventListener("abort", onCancel);
 
     let xhr = null;
+    let result;
     try {
-      const result = await requestStreamXhr(
+      result = await requestStreamXhr(
         "/api/chart/stream",
         JSON.stringify(body),
         () => cancelled.v
       );
-      if (!result.ok) {
-        state.chart.hideLoading();
-        hideChartStatus();
-        // 在错误消息里附带诊断信息
-        let diag = "";
-        if (result.diag) {
-          diag = ` [${result.diag}]`;
-        }
-        const errMsg = (result.errorMessage || "生成失败") + diag;
-        showHint(errMsg, true);
-        showFallbackError(result.errorMessage || "生成失败");
-        return;
-      }
     } catch (e) {
       state.chart.hideLoading();
       if (e.name === "AbortError") {
@@ -568,10 +556,30 @@
       }
       hideChartStatus();
       showHint("请求失败：" + e.message, true);
-    } finally {
       state.genController = null;
       setGenBusy(false);
+      return;
     }
+
+    if (!result.ok) {
+      // 流式失败 → 降级到一次性 JSON 接口（更适合代理环境）
+      // 一次性响应是完整的，代理不会在中途断开
+      const diagMsg = result.diag ? `（流式：${result.diag}）` : "";
+      showHint("流式连接中断，正在重试… " + diagMsg, false);
+      try {
+        await generateFallback(state.genController.signal);
+      } catch (fb_e) {
+        state.chart.hideLoading();
+        hideChartStatus();
+        showHint("降级也失败：" + fb_e.message, true);
+      } finally {
+        state.genController = null;
+        setGenBusy(false);
+      }
+      return;
+    }
+    state.genController = null;
+    setGenBusy(false);
   }
 
   // 用 XMLHttpRequest 处理 SSE 流：按 "\n\n" 切片 + JSON.parse
