@@ -7,28 +7,22 @@
 from __future__ import annotations
 
 import json
-import re
-import ssl
-import urllib.request
-import urllib.error
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Type, TypeVar
 
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
-try:
-    from output_parsers.schema import ProviderConfig
-    _HAS_PYDANTIC = True
-except Exception:
-    _HAS_PYDANTIC = False
+from output_parsers.schema import ProviderConfig
+
+T = TypeVar("T", bound=BaseModel)
 
 # ------------------------- Provider 检测（向后兼容） -------------------------
 
 
-def get_provider_config(base_url: str, provider: Optional[str] = None) -> "ProviderConfig":
+def get_provider_config(base_url: str, provider: Optional[str] = None) -> ProviderConfig:
     """根据 Base URL 返回 Provider 策略配置对象。
-
-    返回值包含 ``thinking_field`` / ``thinking_disabled_value`` / ``thinking_effort_values``
-    三个属性，统一描述该 provider 的 thinking 字段如何映射。
 
     嗅探规则：
 
@@ -37,31 +31,12 @@ def get_provider_config(base_url: str, provider: Optional[str] = None) -> "Provi
     - 其它 → ``"openai"``（含 OpenAI / DeepSeek / DashScope 等 OpenAI 兼容服务）
     """
     u = (base_url or "").lower()
-    name = provider or "openai"
-    if provider is None:
-        if ":11434" in u or "/ollama" in u:
-            name = "ollama"
-        elif "bigmodel.cn" in u or "zhipuai" in u or "zhipu" in u:
-            name = "glm"
-        else:
-            name = "openai"
-    if _HAS_PYDANTIC:
-        return ProviderConfig.for_provider(name)
-    # Pydantic 不可用时，返回一个兼容的命名 tuple
-    _DummyProvider = type("ProviderConfig", (), {"name": name})
-    return _DummyProvider()
+    name = (provider or "").lower() or _sniff_provider(u)
+    return ProviderConfig.for_provider(name)
 
 
-def _detect_provider(base_url: str) -> str:
-    """与旧接口兼容：返回 provider 名字符串。
-
-    新代码请使用 :func:`get_provider_config` 返回带策略的 ``ProviderConfig``。
-    """
-    return get_provider_config(base_url).name if _HAS_PYDANTIC else _legacy_detect(base_url)
-
-
-def _legacy_detect(base_url: str) -> str:
-    u = (base_url or "").lower()
+def _sniff_provider(u: str) -> str:
+    """根据 Base URL 嗅探 provider 名称。"""
     if ":11434" in u or "/ollama" in u:
         return "ollama"
     if "bigmodel.cn" in u or "zhipuai" in u or "zhipu" in u:
@@ -69,30 +44,18 @@ def _legacy_detect(base_url: str) -> str:
     return "openai"
 
 
+def _detect_provider(base_url: str) -> str:
+    """返回 provider 名字符串（兼容旧接口）。"""
+    return get_provider_config(base_url).name
+
+
 def resolve_extra_kwargs(base_url: str, user_value: Optional[str], provider: Optional[str] = None) -> Dict[str, Any]:
     """把用户输入的 ``llm_thinking`` 值解析成传给 LLM 的 extra kwargs。
 
     基于 ``ProviderConfig`` 的策略配置返回 ``{"reasoning_effort": ...}`` 或 ``{"thinking": ...}``。
     """
-    if not _HAS_PYDANTIC:
-        # 降级：手写的旧逻辑
-        return _legacy_resolve_extra(base_url, user_value, provider)
     config = get_provider_config(base_url, provider)
-    return config.resolve_extra(user_value)
-
-
-def _legacy_resolve_extra(base_url: str, user_value: Optional[str], provider: Optional[str] = None) -> Dict[str, Any]:
-    p = (provider or _legacy_detect(base_url)).lower()
-    v = (user_value or "").strip().lower()
-    if v in ("", "off"):
-        if p == "ollama":
-            return {"reasoning_effort": "none"}
-        if p == "glm":
-            return {"thinking": {"type": "disabled"}}
-        return {}
-    if p == "glm":
-        return {"thinking": {"type": "enabled"}}
-    return {"reasoning_effort": v if v in ("low", "medium", "high") else "medium"}
+    return config.resolve_extra(user_value or "")
 
 
 # ------------------------- LangChain ChatOpenAI 封装 -------------------------
@@ -124,50 +87,66 @@ class ChatOpenAIWrapper:
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.provider = _detect_provider(self.base_url)
-        self._llm: Optional[ChatOpenAI] = None
+        # 按 (streaming, frozenset(overrides.items())) 缓存 ChatOpenAI 实例，避免每次调用重建。
+        # 实测每次 ChatOpenAI(**kwargs) 都会触发 httpx Client 创建（百毫秒级）。
+        self._llm_cache: Dict[Any, ChatOpenAI] = {}
 
     def _build_llm(self, stream: bool = False, **overrides) -> ChatOpenAI:
-        """构建或返回缓存的 ChatOpenAI 实例。"""
-        if self._llm is None or overrides:
-            kwargs = {
-                "base_url": self.base_url,
-                "api_key": self.api_key,
-                "model": self.model,
-                "temperature": self.temperature,
-                "max_tokens": self.max_tokens,
-                "streaming": stream,
-                "timeout": 120,
-                **overrides,
-            }
-            return ChatOpenAI(**kwargs)
-        return self._llm
+        """构建或返回缓存的 ChatOpenAI 实例（按 stream + overrides 缓存）。"""
+        cache_key = (stream, frozenset(overrides.items()) if overrides else None)
+        cached = self._llm_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        llm = ChatOpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            streaming=stream,
+            timeout=120,
+            **overrides,
+        )
+        self._llm_cache[cache_key] = llm
+        return llm
 
-    def _build_payload(
+    @staticmethod
+    def to_lc_messages(messages: List[Dict[str, str]]) -> List[BaseMessage]:
+        """把 OpenAI 风格的 ``[{"role":..., "content":...}]`` 转成 LangChain 消息列表。"""
+        out: List[BaseMessage] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                out.append(SystemMessage(content=content))
+            else:
+                out.append(HumanMessage(content=content))
+        return out
+
+    def _bind_common(
         self,
-        messages: List[Dict[str, str]],
-        max_tokens: Optional[int],
-        temperature: Optional[float],
-        response_format: Optional[Dict[str, Any]],
-        reasoning_effort: Optional[str],
-        stream: bool,
-    ) -> Dict[str, Any]:
-        """构建请求 payload（用于手动 HTTP 调用或验证）。"""
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
+        llm: ChatOpenAI,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> Runnable:
+        """把通用参数（max_tokens / temperature / response_format / thinking）绑到 LLM 上。"""
+        bind_kwargs: Dict[str, Any] = {
+            "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
+            "temperature": temperature if temperature is not None else self.temperature,
         }
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if response_format is not None:
-            payload["response_format"] = response_format
-        thinking = resolve_extra_kwargs(self.base_url, reasoning_effort, self.provider)
-        if thinking:
-            payload.update(thinking)
-        if stream:
-            payload["stream"] = True
-        return payload
+        # response_format (json_schema / json_object) 只对 OpenAI 兼容 provider 有效；
+        # Ollama / GLM 等不支持，发送会触发 502 — 跳过
+        if response_format is not None and self.provider not in ("ollama", "glm"):
+            bind_kwargs["response_format"] = response_format
+        # reasoning_effort / thinking 等 provider 特有字段通过 extra_body 传递
+        extra_body = resolve_extra_kwargs(
+            self.base_url, reasoning_effort or self.reasoning_effort, self.provider
+        )
+        if extra_body:
+            bind_kwargs["extra_body"] = extra_body
+        return llm.bind(**bind_kwargs)
 
     def call_llm(
         self,
@@ -197,34 +176,14 @@ class ChatOpenAIWrapper:
     ) -> tuple[str, str]:
         """调用大模型（一次性），返回 ``(content, reasoning)``。"""
         llm = self._build_llm(stream=False)
-        max_t = max_tokens if max_tokens is not None else self.max_tokens
-        temp = temperature if temperature is not None else self.temperature
-
-        # 构建 LangChain messages
-        from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-        langchain_messages: List[BaseMessage] = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                langchain_messages.append(SystemMessage(content=content))
-            else:
-                langchain_messages.append(HumanMessage(content=content))
-
-        # 用 .bind() 把参数绑定到 LLM 上
-        bind_kwargs: Dict[str, Any] = {"max_tokens": max_t, "temperature": temp}
-        # response_format 只对 OpenAI 兼容 provider 有效；Ollama / GLM 等不支持 json_schema 格式，跳过以避免 502
-        if response_format is not None and self.provider not in ("ollama", "glm"):
-            bind_kwargs["response_format"] = response_format
-        # reasoning_effort / thinking 等 provider 特有字段通过 extra_body 传递
-        extra_body = resolve_extra_kwargs(
-            self.base_url, reasoning_effort or self.reasoning_effort, self.provider
+        bound = self._bind_common(
+            llm,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format=response_format,
+            reasoning_effort=reasoning_effort,
         )
-        if extra_body:
-            bind_kwargs["extra_body"] = extra_body
-
-        bound_llm = llm.bind(**bind_kwargs)
-        response = bound_llm.invoke(langchain_messages)
+        response = bound.invoke(self.to_lc_messages(messages))
 
         content = ""
         reasoning = ""
@@ -248,33 +207,16 @@ class ChatOpenAIWrapper:
         reasoning_effort: Optional[str] = None,
     ) -> Iterator[str]:
         """流式调用大模型，逐 chunk 产出 content。"""
-        max_t = max_tokens if max_tokens is not None else self.max_tokens
-        temp = temperature if temperature is not None else self.temperature
-
-        from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-        langchain_messages: List[BaseMessage] = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                langchain_messages.append(SystemMessage(content=content))
-            else:
-                langchain_messages.append(HumanMessage(content=content))
-
         llm = self._build_llm(stream=True)
-
-        bind_kwargs: Dict[str, Any] = {"max_tokens": max_t, "temperature": temp}
-        if response_format is not None and self.provider not in ("ollama", "glm"):
-            bind_kwargs["response_format"] = response_format
-        extra_body = resolve_extra_kwargs(
-            self.base_url, reasoning_effort or self.reasoning_effort, self.provider
+        bound = self._bind_common(
+            llm,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format=response_format,
+            reasoning_effort=reasoning_effort,
         )
-        if extra_body:
-            bind_kwargs["extra_body"] = extra_body
-
-        bound_llm = llm.bind(**bind_kwargs)
         try:
-            for event in bound_llm.stream(langchain_messages):
+            for event in bound.stream(self.to_lc_messages(messages)):
                 if isinstance(event, AIMessage):
                     content = event.content or ""
                     if content:
@@ -282,12 +224,33 @@ class ChatOpenAIWrapper:
         except Exception as e:
             raise RuntimeError(f"LLM 流式调用失败：{e}") from e
 
-    @property
-    def llm(self) -> ChatOpenAI:
-        """获取底层的 ChatOpenAI 实例（延迟初始化）。"""
-        if self._llm is None:
-            self._llm = self._build_llm(stream=False)
-        return self._llm
+    def structured(
+        self,
+        schema: Type[T],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> Runnable:
+        """返回一个 LangChain ``Runnable``，调用后直接返回 ``schema`` 类型的 Pydantic 对象。
+
+        内部用 :meth:`ChatOpenAI.with_structured_output`：
+
+        - 自动在 system prompt 注入 JSON schema 说明
+        - 对 OpenAI 兼容 provider 走 ``response_format=json_schema`` 严格模式
+        - 对 Ollama / GLM 走 tool-calling 兼容模式（不同 LangChain 版本有差异）
+        - 用 Pydantic 校验返回值，失败时自动重试
+        """
+        from langchain_core.language_models import BaseChatModel
+        llm = self._build_llm(stream=False)
+        bound = self._bind_common(
+            llm,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format=None,  # with_structured_output 内部自行设置
+            reasoning_effort=reasoning_effort,
+        )
+        assert isinstance(bound, BaseChatModel), "with_structured_output requires a chat model"
+        return bound.with_structured_output(schema)
 
 
 # ------------------------- 兼容旧接口的函数 -------------------------
@@ -469,9 +432,23 @@ def compute_column_stats(
     return "\n".join(lines)
 
 
-def _detect_provider_for_client(base_url: str) -> str:
-    """暴露给外部的 provider 检测函数。"""
-    return _detect_provider(base_url)
+_ALLOWED_CHART_TYPES = frozenset({
+    "bar", "line", "pie", "scatter", "radar", "gauge", "funnel",
+    "candlestick", "heatmap", "sunburst", "treemap", "sankey",
+    "boxplot", "pictorialbar", "effectscatter",
+})
+
+
+def _lc_messages_to_dicts(messages: List[Any]) -> List[Dict[str, str]]:
+    """LangChain 消息列表 → ``[{"role","content"}]`` dict 列表。"""
+    out: List[Dict[str, str]] = []
+    role_map = ((SystemMessage, "system"), (HumanMessage, "user"), (AIMessage, "assistant"))
+    for m in messages:
+        for klass, role in role_map:
+            if isinstance(m, klass):
+                out.append({"role": role, "content": m.content})
+                break
+    return out
 
 
 def pick_chart_type(
@@ -479,42 +456,49 @@ def pick_chart_type(
     prompt: str,
     data: Optional[Dict[str, Any]],
     hint: str,
-):
-    """让 LLM 根据需求和数据推荐一个图表类型。"""
+) -> tuple[str, str]:
+    """让 LLM 根据需求和数据推荐一个图表类型。返回 ``(chart_type, reason)``。"""
     if hint:
         return hint, "用户指定图表类型。"
 
-    data_desc = ""
-    if data and data.get("rows"):
-        raw_cols = data.get("columns") or []
-        if raw_cols and isinstance(raw_cols[0], dict):
-            cols = ", ".join(str(c.get("name") or "") for c in raw_cols)
-        else:
-            cols = ", ".join(str(c) for c in raw_cols)
-        sample = json.dumps(data["rows"][:3], ensure_ascii=False)
-        extra = ""
-        if data.get("summary"):
-            extra = f"\n数据集摘要：{data['summary']}"
-        data_desc = f"\n数据字段：{cols}\n样例：{sample}\n行数：{len(data['rows'])}{extra}"
+    from output_parsers.schema import ChartTypeRecommendation
+    from prompts import format_data_for_type_prompt, chart_type_prompt_template
 
-    system = (
-        "你是一个专业的数据可视化助手，请根据用户的需求与数据，推荐一个最合适的 ECharts 图表类型。"
-        "请只回复一个英文单词，从以下类型中选择：bar, line, pie, scatter, radar, gauge, funnel, candlestick, heatmap, sunburst, treemap, sankey, boxplot, pictorialBar, effectScatter。"
-        "随后用一行中文简短解释选择理由。"
-        "示例输出：\nbar\n用于比较不同类别之间的数值大小，适合该场景的分类数据对比。"
-    )
-    user = f"用户需求：{prompt or '根据提供的数据自动生成合适的图表'}{data_desc}\n\n请给出推荐图表类型与理由。"
+    tmpl_params = format_data_for_type_prompt(prompt, data, list(_ALLOWED_CHART_TYPES))
+    rendered = chart_type_prompt_template().format_messages(**tmpl_params)
+    lc_messages = _lc_messages_to_dicts(rendered)
+
+    try:
+        structured = get_llm_wrapper(cfg).structured(
+            ChartTypeRecommendation,
+            max_tokens=200,
+            temperature=0.3,
+            reasoning_effort=cfg.get("reasoning_effort") or None,
+        )
+        result = structured.invoke(lc_messages)
+        chart_type = (result.chart_type or "").lower().strip() or "bar"
+        if chart_type not in _ALLOWED_CHART_TYPES:
+            chart_type = "bar"
+        return chart_type, result.reason or "自动选择。"
+    except Exception:
+        # structured 失败（不支持 / 校验失败）→ 走 fallback：用普通 call_llm + 取首行
+        return _pick_chart_type_fallback(cfg, lc_messages)
+
+
+def _pick_chart_type_fallback(cfg: Dict[str, Any], messages: List[Dict[str, str]]) -> tuple[str, str]:
+    """``pick_chart_type`` 的兼容回退：直接用 ChatPromptTemplate 渲染好的消息发出去，
+    模型回首行 chart_type + 第二行理由。
+    """
     reply = call_llm(
         cfg,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        messages=messages,
         max_tokens=200,
         temperature=0.3,
         reasoning_effort=cfg.get("reasoning_effort") or None,
     )
     lines = [ln.strip() for ln in reply.strip().splitlines() if ln.strip()]
     chart_type = lines[0].lower() if lines else "bar"
-    allowed = {"bar","line","pie","scatter","radar","gauge","funnel","candlestick","heatmap","sunburst","treemap","sankey","boxplot","pictorialbar","effectscatter"}
-    if chart_type not in allowed:
+    if chart_type not in _ALLOWED_CHART_TYPES:
         chart_type = "bar"
     reason = " ".join(lines[1:]) or "自动选择。"
     return chart_type, reason
@@ -527,63 +511,6 @@ def build_chart_prompt(
     style_hint: Optional[Dict[str, Any]],
     knowledge: Dict[str, Any],
 ) -> str:
-    pieces = []
-    pieces.append(f"请使用 Apache ECharts 绘制一张「{chart_type}」类型图表。")
-    if prompt:
-        pieces.append(f"用户需求：{prompt}")
-
-    if data and data.get("rows"):
-        raw_cols = data.get("columns") or []
-        if raw_cols and isinstance(raw_cols[0], dict):
-            column_names = [str(c.get("name") or "") for c in raw_cols]
-            schema_lines = [
-                f"- {c.get('name')} ({c.get('type','string')}/{c.get('role','value')}): {c.get('description','')}"
-                for c in raw_cols
-            ]
-            pieces.append("数据 schema：\n" + "\n".join(schema_lines))
-        else:
-            column_names = [str(c) for c in raw_cols]
-        rows = data["rows"]
-        pieces.append("数据字段：" + ", ".join(column_names))
-
-        stats_text = compute_column_stats(rows, column_names)
-        if stats_text:
-            pieces.append(f"【数据统计摘要 (共 {len(rows)} 行)】\n{stats_text}")
-
-        if len(rows) > 100:
-            shown = rows[:100]
-            pieces.append(f"数据共 {len(rows)} 行，仅发送前 100 行用于演示；"
-                          f"请在生成代码时按相同字段保留完整结构：")
-        else:
-            shown = rows
-        pieces.append("数据 JSON：")
-        pieces.append(json.dumps(shown, ensure_ascii=False))
-
-        if data.get("summary"):
-            pieces.append(f"数据集摘要：{data['summary']}")
-        if data.get("notes") and data.get("notes") not in ("", "无"):
-            pieces.append(f"数据整理说明：{data['notes']}")
-
-    if style_hint:
-        pieces.append(f"样式偏好：{json.dumps(style_hint, ensure_ascii=False)}")
-
-    pieces.append(
-        "请严格按 response_format 给定的 JSON schema 输出（不要写 Markdown 代码块、不要任何前后缀文字），"
-        "其中：\n"
-        "1) option 是完整的 ECharts 配置对象（title/tooltip/legend/grid/xAxis/yAxis/series/color 等），"
-        "series.data 填入真实数值；\n"
-        "2) xAxis/yAxis/legend 的内容与数据列名一致；\n"
-        "3) 标题/副标题可以留空；\n"
-        "4) 禁止 JS 函数字面量（JSON 不支持函数），自定义 formatter 用 ECharts 字符串模板"
-        "（如 '{b}: {c}'），自定义配色用 series 顶层 color: [...] 数组或省略；\n"
-        "5) content 字段填 30-80 字中文文字解释该图表表达的核心信息（最大/最小/趋势/对比），"
-        "不要复述数据，不要 markdown 格式。"
-    )
-
-    if knowledge:
-        pieces.append("【ECharts 配置项指导】")
-        for section_name, content in knowledge.items():
-            pieces.append(f"-- {section_name} --")
-            pieces.append(content)
-
-    return "\n\n".join(pieces)
+    """向后兼容的薄封装：图表生成 user prompt 由 :mod:`prompts.build_chart_user_prompt` 统一构建。"""
+    from prompts import build_chart_user_prompt
+    return build_chart_user_prompt(prompt, data, chart_type, style_hint, knowledge)

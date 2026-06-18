@@ -130,11 +130,10 @@ def _other_numeric_cols(rows: List[dict], columns: list, exclude: str) -> List[s
 
 def _group_aggregate(rows: List[dict], columns: list, by, *, agg: str):
     """按列 by 聚合（sum 或 mean）。返回 (new_rows, info)。"""
+    verb = "求和" if agg == "sum" else "求平均"
     if not by or not any(_col_name(c) == by for c in columns):
-        verb = "求和" if agg == "sum" else "求平均"
         return rows, {"action": f"分组{verb}：找不到列「{by}」", "skipped": True}
     other_cols = _other_numeric_cols(rows, columns, exclude=by)
-    verb = "求和" if agg == "sum" else "求平均"
     if not other_cols:
         return rows, {"action": f"分组{verb}：没有其它数值列", "skipped": True}
     from collections import OrderedDict
@@ -569,8 +568,9 @@ def preprocess_data(prompt: str, data: dict) -> Tuple[dict, dict]:
     new_data["rows"] = rows
     new_data["count"] = len(rows)
     if new_data.get("description"):
+        col_names = [n for n in (_col_name(c) for c in columns) if n]
         new_data["description"] = (
-            f"预处理后：{len(rows)} 行 × {len(_column_names(columns))} 列；"
+            f"预处理后：{len(rows)} 行 × {len(col_names)} 列；"
             + (new_data["description"] or "")
         )
 
@@ -580,7 +580,3 @@ def preprocess_data(prompt: str, data: dict) -> Tuple[dict, dict]:
         "skipped": skipped,
         "summary": summary,
     }
-
-
-def _column_names(columns) -> List[str]:
-    return [n for n in (_col_name(c) for c in columns) if n]

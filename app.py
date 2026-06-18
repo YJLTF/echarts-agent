@@ -4,11 +4,10 @@ import json
 import os
 import re
 import sqlite3
-import threading
-import time
+import traceback
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Optional
+from typing import Any, Optional
 
 from flask import (
     Flask,
@@ -21,16 +20,16 @@ from flask import (
 from flask_cors import CORS
 from werkzeug.datastructures import FileStorage
 
-from llm_client import call_llm, call_llm_stream, call_llm_raw, build_chart_prompt, pick_chart_type
+from llm_client import call_llm, call_llm_stream, call_llm_raw, build_chart_prompt, get_llm_wrapper, pick_chart_type
 import llm_client
 from data_parser import parse_upload, parse_data_text, list_excel_sheets
 from data_understanding import understand_data
 from data_preprocessing import preprocess_data
 from knowledge import search_knowledge, get_knowledge_for_type
+import prompts
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-KB_DIR = os.path.join(BASE_DIR, "knowledge")
 DB_PATH = os.path.join(BASE_DIR, "app.db")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -147,56 +146,24 @@ def _get_param(name: str):
     )
 
 
-_DEFAULT_SYSTEM_PROMPT = """你是一名资深的 Apache ECharts 图表工程师，擅长把数据快速转化成生产级 ECharts option。
-
-【硬约束 — 不可违反】
-0) **回复首字符必须是 `{`，末字符必须是 `}`，整篇回复只包含一个 JSON 对象**。**严禁**使用 Markdown 代码块、严禁写任何前后缀文字、严禁重复输出多个对象。
-1) 严格按 response_format 给定的 JSON schema 输出。
-2) 严格使用用户给的数据，不编造、不替换；xAxis/yAxis 的 data 与列名一致；数值不要用字符串。
-3) 数值轴用 type:'value'；类别轴 type:'category' 并提供 data 数组；时间轴 type:'time'。
-4) 配色统一用 ECharts 默认调色板（#5470c6 #91cc75 #ee6666 #73a0fa #fac858 #3ba272 等）；用户没指定时不要硬编色名。
-5) 标题/副标题/网格/tooltip/legend 按需配置；不输出你无法控制的字段（CDN URL、外部图片、_placeholder 之类）。
-6) 【禁止 JS 函数】option 中**禁止**出现 `function (...) {…}` / `() => {…}` 等函数字面量（JSON 不支持函数，会导致解析失败）：
-   - 自定义 tooltip / label / axisLabel 文案 → 用字符串模板，如 `'{b}: {c}'`、`'{a} <br/>{b}: {c}'`、`'{b} ({c}%)'`
-   - 自定义节点 / 系列配色 → 用 series 顶层 `color: [...]` 数组（让 ECharts 循环取色），或省略该字段使用默认色
-   - 字符串模板占位符：`{a}` 系列名 / `{b}` 类目名或数据名 / `{c}` 数值 / `{d}` 饼图百分比 / `{@xxx}` 指定维度值
-7) content 字段填 30-80 字中文文字解释该图表表达的核心信息（最大/最小/趋势/对比），不要复述数据。
-
-【最小可用结构 —— 必须严格按此形状输出，option 里只能放 ECharts 字段，绝对不要把 "content" 写进 option】
-{
-  "option": {
-    "title": {"text": "某月销售额"},
-    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-    "grid": {"left": 40, "right": 20, "top": 30, "bottom": 30, "containLabel": true},
-    "xAxis": {"type": "category", "data": ["1月", "2月", "3月"]},
-    "yAxis": {"type": "value"},
-    "series": [
-      {"name": "销售额", "type": "bar", "data": [120, 132, 101], "itemStyle": {"borderRadius": [4, 4, 0, 0]}}
-    ]
-  },
-  "content": "3月销售额最低 101，2月最高 132，整体在 100-140 之间波动。"
-}
-
-用户给的需求、数据统计摘要、图表类型专属 KB 都在下方用户消息里，按它们生成。"""
-
-
-# 主生成阶段的结构化输出 schema。
-# - option：ECharts option 整体是结构自由的（字段 200+），用 additionalProperties: true 兜住；
-#   真正能强约束的是 content 字段。
-# - content：30-80 字中文文字解释。
-# OpenAI 严格模式要求 additionalProperties 在 schema 中显式声明，因此顶层和 option 都要写。
+# 主生成阶段的结构化输出 schema（用于流式路径的 response_format）。
+# 双模式：``option`` (JSON dict) 或 ``code`` (JS 代码字符串) 至少一个非空，``content`` 必填。
+# 非流式路径走 ``wrapper.structured(ChartGenerationResponse)`` 内部自带 schema，不用这个常量。
 _CHART_RESPONSE_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
         "name": "echarts_chart_response",
-        "strict": True,
         "schema": {
             "type": "object",
             "properties": {
                 "option": {
-                    "type": "object",
-                    "description": "完整的 Apache ECharts option 配置对象。",
+                    "type": ["object", "null"],
+                    "description": "mode=option 时的 ECharts JSON 配置对象（不含函数）。",
                     "additionalProperties": True,
+                },
+                "code": {
+                    "type": ["string", "null"],
+                    "description": "mode=code 时的完整 JS 代码（含 const option = {...}; chart.setOption(option);）。",
                 },
                 "content": {
                     "type": "string",
@@ -204,7 +171,7 @@ _CHART_RESPONSE_SCHEMA = {
                     "minLength": 1,
                 },
             },
-            "required": ["option", "content"],
+            "required": ["content"],
             "additionalProperties": False,
         },
     },
@@ -233,6 +200,30 @@ def _strip_json_fence(raw: str) -> tuple[Optional[str], str]:
     return inside, outside
 
 
+def _unescape_braces(s: str) -> str:
+    """把 ChatPromptTemplate 风格的 ``{{`` / ``}}`` 占位符还原为单花括号。
+
+    LLM 偶尔会误把 JSON 中的 ``{`` 转义成 ``{{``（受 f-string / 模板语法训练数据副作用），
+    直接 ``json.loads`` 会失败。这里做一次轻量修复，再走解析。
+    """
+    return s.replace("{{", "{").replace("}}", "}")
+
+
+def _try_parse_json(raw: str) -> Optional[Any]:
+    """尝试 ``json.loads``；失败时再做一次 ``{{``/``}}`` 反转义重试。"""
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    unescaped = _unescape_braces(raw)
+    if unescaped != raw:
+        try:
+            return json.loads(unescaped)
+        except Exception:
+            pass
+    return None
+
+
 def _parse_structured_chart(raw: str) -> tuple[Optional[dict], Optional[str], Optional[str], str]:
     """从 LLM 单次返回里直接抠出 (option, content, method, error)。
 
@@ -245,8 +236,9 @@ def _parse_structured_chart(raw: str) -> tuple[Optional[dict], Optional[str], Op
         (option, content, method, error)
         - 成功：error 为 ``""``
         - 失败：option / content / method 为 ``None``，error 描述问题
-        - method 取值：``"primary"`` / ``"in_option"`` / ``"fence_fence_full"`` /
-          ``"fence_fence_option"`` / ``"fence_fence_in_option"``，前端用来显示"LLM 偏离"徽章
+        - method 取值：``"primary"`` / ``"primary_bare"`` / ``"in_option"`` /
+          ``"fence_full"`` / ``"fence_option"`` / ``"fence_in_option"``；
+          非 ``primary`` / ``primary_bare`` 时前端顶部显示「⚠ LLM 偏离 schema」徽章。
     """
     if not raw or not raw.strip():
         return None, None, None, "LLM 返回为空"
@@ -280,11 +272,8 @@ def _parse_structured_chart(raw: str) -> tuple[Optional[dict], Optional[str], Op
             return new_option, content_val, True
         return obj, "", False
 
-    # 1) 主路径：直接 json.loads
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        obj = None
+    # 1) 主路径：直接 json.loads（自动兼容 {{ }} 转义）
+    obj = _try_parse_json(raw)
     if obj is not None:
         got = _validate(obj)
         if got[0] is not None and got[1] is not None:
@@ -297,10 +286,7 @@ def _parse_structured_chart(raw: str) -> tuple[Optional[dict], Optional[str], Op
     # 2) 兜底：strip ```json...``` 围栏
     inside, outside = _strip_json_fence(raw)
     if inside:
-        try:
-            inner_obj = json.loads(inside)
-        except Exception:
-            inner_obj = None
+        inner_obj = _try_parse_json(inside)
         if isinstance(inner_obj, dict):
             got = _validate(inner_obj)
             if got[0] is not None and got[1] is not None:
@@ -315,11 +301,59 @@ def _parse_structured_chart(raw: str) -> tuple[Optional[dict], Optional[str], Op
                 return opt2, cnt2, ("fence_in_option" if popped else "fence_option"), ""
 
     preview = raw.strip().replace("\n", " ")[:160]
-    return None, None, None, f"模型输出不符合结构化 schema：JSON.loads 失败或字段缺失（reply: {preview!r}）"
+    # 顺便给一个明显的「输出被截断」提示，便于快速判断是 LLM 没输出完 vs JSON 格式错误
+    trunc_hint = ""
+    stripped = raw.strip()
+    if stripped and not stripped.endswith(("{", "}", "`", '"', "]")):
+        trunc_hint = "（输出似乎被截断 —— max_tokens 可能不够）"
+    return None, None, None, f"模型输出不符合结构化 schema{trunc_hint}：JSON.loads 失败或字段缺失（reply: {preview!r}）"
+
+
+def _parse_chart_response(raw: str) -> tuple[Optional[dict], Optional[str], Optional[str], str, str]:
+    """Pydantic 优先的图表响应解析（双模式：返回 option / code / content）。
+
+    Returns:
+        (option, code, content, parse_method, error)
+        - 成功：error 为 ``""``，``parse_method`` 形如 ``primary`` / ``in_option`` / ``fence_*``
+        - 失败：前 3 项为 ``None``，``parse_method`` 为 ``""``，``error`` 描述问题
+
+    路径：
+
+    1. Pydantic 强类型校验 ``ChartGenerationResponse`` —— 支持 ``option`` 或 ``code`` 双模式
+    2. 5 层手写兜底（仅返回 option，不识别 code）
+
+    兼容：原始 raw 含 ``{{`` / ``}}`` 转义（LLM 受 f-string 训练数据副作用）时，
+    会先按 unescape 后的版本再校验一次 Pydantic。
+    """
+    if not raw or not raw.strip():
+        return None, None, None, "", "LLM 返回为空"
+
+    from output_parsers.schema import ChartGenerationResponse
+
+    # 路径 1：Pydantic 强类型校验（支持 option / code 双模式）。
+    # 先试 raw；失败时再试 unescape 后的版本（兼容 LLM 把 { 转义成 {{ 的副作用）。
+    candidates = [raw]
+    unescaped = _unescape_braces(raw)
+    if unescaped != raw:
+        candidates.append(unescaped)
+    for candidate in candidates:
+        try:
+            result = ChartGenerationResponse.model_validate_json(candidate, strict=False)
+            if result.content and (result.option or result.code):
+                return result.option, result.code, result.content, "primary", ""
+        except Exception:
+            pass
+
+    # 路径 2：老 5 层手写兜底（仅识别 option 模式；{{ }} 自动兼容）
+    opt, content, method, err = _parse_structured_chart(raw)
+    return opt, None, content, method or "", err
 
 
 # 推理深度合法取值。空串 / off / low / medium / high —— "off" 与空串都视为"不发送"。
 _LLM_THINKING_ALLOWED = {"", "off", "low", "medium", "high"}
+
+# Provider 显式选择。空串 = 自动嗅探；其它值覆盖嗅探结果。
+_LLM_PROVIDER_ALLOWED = {"", "openai", "ollama", "glm"}
 
 
 def _normalize_thinking(v: object) -> str:
@@ -328,10 +362,20 @@ def _normalize_thinking(v: object) -> str:
     return s if s in _LLM_THINKING_ALLOWED else ""
 
 
+def _normalize_provider(v: object) -> str:
+    """把用户/DB 里的 llm_provider 值归一化成合法取值。空串 = 自动嗅探。"""
+    s = str(v or "").strip().lower()
+    return s if s in _LLM_PROVIDER_ALLOWED else ""
+
+
 def build_llm_cfg() -> dict:
     cfg = get_all_config()
     thinking = _normalize_thinking(cfg.get("llm_thinking"))
     base_url = cfg.get("llm_base_url", "").strip().rstrip("/")
+    explicit_provider = _normalize_provider(cfg.get("llm_provider"))
+    # 用户在配置页显式选过 provider 时优先使用；否则走 URL 嗅探。
+    # 嗅探结果缓存：相同 base_url 走相同分支，避免每次 pipeline 重算。
+    provider = explicit_provider or llm_client._detect_provider(base_url)
     return {
         "base_url": base_url,
         "api_key": cfg.get("llm_api_key", "").strip(),
@@ -344,7 +388,7 @@ def build_llm_cfg() -> dict:
         "reasoning_effort": "" if thinking in ("", "off") else thinking,
         # Provider 嗅探：Ollama 的 reasoning_effort 语义与 OpenAI 略有差异
         # —— "off" 在 Ollama 上要发 "none" 才会真正关闭思考
-        "provider": llm_client._detect_provider(base_url),
+        "provider": provider,
     }
 
 
@@ -373,6 +417,10 @@ def api_config_get():
     else:
         cfg["llm_api_key_present"] = False
         cfg["llm_api_key_masked"] = ""
+    # 让前端在「自动」模式下能展示按 Base URL 嗅探出的实际 provider，
+    # 方便用户判断要不要手动改。
+    base_url = (cfg.get("llm_base_url") or "").strip()
+    cfg["llm_provider_detected"] = llm_client._detect_provider(base_url) if base_url else ""
     return jsonify(cfg)
 
 
@@ -388,6 +436,7 @@ def api_config_set():
         "llm_base_url",
         "llm_api_key",
         "llm_model",
+        "llm_provider",
         "system_prompt",
         "llm_temperature",
         "llm_max_tokens",
@@ -400,6 +449,9 @@ def api_config_set():
             if not isinstance(v, str) or not v.strip():
                 continue
             v = v.strip()
+        elif k == "llm_provider":
+            # provider 显式选择：空串 = 自动嗅探；非法值忽略
+            v = _normalize_provider(v)
         elif k == "llm_thinking":
             # 推理深度：必须落在白名单里；非法值原样存（前端下拉会兜底）
             v = str(v).strip()
@@ -418,24 +470,7 @@ def api_config_test():
     """
     body = request.get_json(silent=True) or {}
     cfg = build_llm_cfg()
-    if body.get("llm_base_url"):
-        cfg["base_url"] = str(body["llm_base_url"]).strip().rstrip("/")
-    if body.get("llm_api_key"):
-        cfg["api_key"] = str(body["llm_api_key"]).strip()
-    if body.get("llm_model"):
-        cfg["model"] = str(body["llm_model"]).strip()
-    if "llm_temperature" in body and body["llm_temperature"] is not None:
-        try:
-            cfg["temperature"] = float(body["llm_temperature"])
-        except (TypeError, ValueError):
-            pass
-    if "llm_max_tokens" in body and body["llm_max_tokens"] is not None:
-        try:
-            cfg["max_tokens"] = int(body["llm_max_tokens"])
-        except (TypeError, ValueError):
-            pass
-    if "llm_thinking" in body and body["llm_thinking"] is not None:
-        cfg["reasoning_effort"] = "" if _normalize_thinking(body["llm_thinking"]) in ("", "off") else _normalize_thinking(body["llm_thinking"])
+    _apply_body_overrides(cfg, body)
 
     if not cfg["api_key"]:
         return jsonify({"ok": False, "message": "未填写 API Key（请在表单填入或先保存一次）"}), 400
@@ -453,6 +488,36 @@ def api_config_test():
         return jsonify({"ok": False, "message": str(e)}), 500
 
 
+def _apply_body_overrides(cfg: dict, body: dict) -> None:
+    """把请求体里非空的字段覆盖到 ``cfg`` 上（``api_config_test`` 用）。"""
+    def _set_str(key: str, target: str, transform=str.strip):
+        v = body.get(key)
+        if v:
+            cfg[target] = transform(str(v))
+
+    _set_str("llm_base_url", "base_url", lambda s: s.strip().rstrip("/"))
+    _set_str("llm_api_key", "api_key")
+    _set_str("llm_model", "model")
+
+    if "llm_provider" in body and body["llm_provider"] is not None:
+        explicit = _normalize_provider(body["llm_provider"])
+        cfg["provider"] = explicit or llm_client._detect_provider(cfg["base_url"])
+
+    for src, dst, cast in (
+        ("llm_temperature", "temperature", float),
+        ("llm_max_tokens", "max_tokens", int),
+    ):
+        if src in body and body[src] is not None:
+            try:
+                cfg[dst] = cast(body[src])
+            except (TypeError, ValueError):
+                pass
+
+    if "llm_thinking" in body and body["llm_thinking"] is not None:
+        norm = _normalize_thinking(body["llm_thinking"])
+        cfg["reasoning_effort"] = "" if norm in ("", "off") else norm
+
+
 @app.route("/api/parse", methods=["POST"])
 def api_parse():
     """解析用户上传的文件或直接粘贴的数据文本。
@@ -464,7 +529,7 @@ def api_parse():
       要求 LLM 配置已填写完成。
     """
     file = request.files.get("file")
-    text = request.form.get("text") or _get_param("text")
+    text = _get_param("text")
 
     use_llm = parse_bool(_get_param("use_llm"))
     no_header = parse_bool(_get_param("no_header"))
@@ -595,8 +660,6 @@ def api_chart_stream():
 
     - 生成器全程用 ``yield`` 推送，每产生一个事件立即 flush，避免被中间代理/
       服务器缓冲；
-    - 内置心跳（heartbeat）事件：每 8 秒若还没有真实事件产出，则发一个空
-      ``: heartbeat`` 注释事件，让代理与浏览器知道连接仍活跃；
     - 所有异常都被包住 → 以 ``{"type":"error"}`` 事件正常结束流，而不是
       让底层抛出异常把 TCP 连接打断，避免前端报 "读取流失败"。
     """
@@ -606,18 +669,15 @@ def api_chart_stream():
     def generate():
         # 先推一条注释，让代理/浏览器建立流状态
         yield ": ok\n\n"
-        last_evt_at = time.time()
         try:
             for evt in run_chart_pipeline(
                 cfg, prompt, data, chart_type_hint, style_hint, stream=True
             ):
                 yield _sse_format_event(evt)
-                last_evt_at = time.time()
                 if evt.get("type") in ("done", "error"):
                     return
         except Exception as e:
             # pipeline 生成器自身抛异常（不应发生，但兜底）
-            import traceback
             traceback.print_exc()
             yield _sse_format_event(
                 {"type": "error", "message": f"生成失败：{e}"}
@@ -789,27 +849,13 @@ def run_chart_pipeline(
     }
 
     # ---- 5) 检索知识库 + 构造 prompt ----
+    # 把预处理结果挂在 data 上，让 build_chart_user_prompt 内部自动加上精度提示。
+    if has_applied and isinstance(data, dict):
+        data = {**data, "preprocess": preprocess_info}
     kb = get_knowledge_for_type(chosen_type)
     gen_prompt = build_chart_prompt(prompt, data, chosen_type, style_hint, kb)
 
-    # 把预处理结果作为附加上下文告诉 LLM，让它知道数据已经被改过，
-    # 这样它能正确选择 tooltip / axisLabel 的精度（如 .toFixed(2)）。
-    if has_applied:
-        actions = [
-            a.get("action")
-            for a in preprocess_info.get("applied", [])
-            if a.get("action") and not a.get("skipped")
-        ]
-        actions = [a for a in actions if a]
-        if actions:
-            gen_prompt += (
-                "\n\n【数据预处理已应用】以下规则已对数据生效（前端已按结果展示，"
-                "请在 ECharts option 的 tooltip / axisLabel / series.label 等展示处使用与数据一致的精度"
-                "（例如 toFixed(2)），避免出现 1.2300000001 之类的尾数）：\n"
-                + "\n".join(f"- {a}" for a in actions)
-            )
-
-    sys_prompt = cfg["system_prompt"] or _DEFAULT_SYSTEM_PROMPT
+    sys_prompt = cfg["system_prompt"] or prompts.DEFAULT_CHART_SYSTEM_PROMPT
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": gen_prompt},
@@ -845,48 +891,49 @@ def run_chart_pipeline(
                 raw += chunk
                 if chunk:
                     yield {"type": "delta", "content": chunk}
-            reasoning = ""
 
-            # 流式中途失败且有部分输出 → 尝试降级解析
-            if stream_failed and not raw.strip():
-                # 完全没收到数据 → 报错
+            # 流式中途失败的两种情况：
+            # 1) 完全没收到数据 → 报错
+            # 2) 有部分输出 → 继续走解析路径（前端展示「降级解析」徽章）
+            if stream_failed:
+                if not raw.strip():
+                    yield {"type": "stage", "stage": "generate", "status": "error", "message": stream_error_msg}
+                    yield {"type": "error", "message": f"模型流式调用失败：{stream_error_msg}", "raw_reply": raw, "status": 500}
+                    return
                 yield {
-                    "type": "stage",
-                    "stage": "generate",
-                    "status": "error",
-                    "message": stream_error_msg,
-                }
-                yield {
-                    "type": "error",
-                    "message": f"模型流式调用失败：{stream_error_msg}",
-                    "raw_reply": raw,
-                    "status": 500,
-                }
-                return
-            elif stream_failed:
-                # 有部分输出 → 尝试用已有数据继续解析（降级模式）
-                yield {
-                    "type": "stage",
-                    "stage": "generate",
-                    "status": "done",
-                    "length": len(raw),
-                    "degraded": True,
-                    "degraded_reason": stream_error_msg,
+                    "type": "stage", "stage": "generate", "status": "done",
+                    "length": len(raw), "degraded": True, "degraded_reason": stream_error_msg,
                 }
                 yield {"type": "delta", "content": "\n\n[注：模型输出中断，已用部分结果降级解析]"}
-            else:
-                pass  # 正常完成
         else:
-            raw, reasoning = call_llm_raw(
-                cfg,
-                messages=messages,
-                max_tokens=cfg["max_tokens"],
-                temperature=cfg["temperature"],
-                response_format=_CHART_RESPONSE_SCHEMA,
-                reasoning_effort=cfg.get("reasoning_effort") or None,
-            )
-            if reasoning:
-                raw = f"<think>\n{reasoning}\n</think>\n\n{raw}"
+            # 非流式：优先用 ``with_structured_output(ChartGenerationResponse)``
+            # —— LangChain 内部自动注入 JSON schema 说明 + 失败重试 + Pydantic 校验
+            from output_parsers.schema import ChartGenerationResponse
+            try:
+                structured = get_llm_wrapper(cfg).structured(
+                    ChartGenerationResponse,
+                    max_tokens=cfg["max_tokens"],
+                    temperature=cfg["temperature"],
+                    reasoning_effort=cfg.get("reasoning_effort") or None,
+                )
+                result = structured.invoke(messages)
+                if isinstance(result, ChartGenerationResponse):
+                    raw = result.model_dump_json()
+                else:
+                    # 异常分支 —— 退回去走原始 call_llm_raw + 5 层解析
+                    raise RuntimeError("structured() returned non-pydantic")
+            except Exception as structured_err:
+                print(f"[pipeline] structured() failed: {structured_err}; falling back to call_llm_raw", flush=True)
+                raw, _reasoning = call_llm_raw(
+                    cfg,
+                    messages=messages,
+                    max_tokens=cfg["max_tokens"],
+                    temperature=cfg["temperature"],
+                    response_format=_CHART_RESPONSE_SCHEMA,
+                    reasoning_effort=cfg.get("reasoning_effort") or None,
+                )
+                # 注意：不把 reasoning 拼进 raw —— 解析器会用正则剥掉 <think>，
+                # 拼上去只会徒增字符。如果想保留 reasoning，应该单独存。
     except Exception as e:
         print(f"[pipeline] 生成阶段异常: {e}", flush=True)
         yield {
@@ -900,26 +947,30 @@ def run_chart_pipeline(
     if not stream_failed:
         yield {"type": "stage", "stage": "generate", "status": "done", "length": len(raw)}
 
-    # ---- 7) 解析（结构化输出 → 一次 json.loads 即够） ----
+    # ---- 7) 解析（结构化输出 → 一次 Pydantic 校验即够） ----
     yield {"type": "stage", "stage": "parse", "label": "解析与校验", "status": "start"}
-    option, content, parse_method, parse_error = _parse_structured_chart(raw)
-    if parse_error:
+    option, code, content, parse_method, parse_error = _parse_chart_response(raw)
+    if parse_error or not content:
+        # stage error message 用简短摘要，详细错误由 error 事件 + raw_reply 承载
+        short_msg = "模型输出不符合 schema（请看顶部错误提示）" if parse_error else "缺少 content 字段"
         yield {
             "type": "stage",
             "stage": "parse",
             "status": "error",
-            "message": parse_error,
+            "message": short_msg,
         }
         yield {
             "type": "error",
-            "message": f"模型输出不符合结构化 schema：{parse_error}",
+            "message": parse_error or "模型输出缺少 content 字段",
             "raw_reply": raw,
             "status": 502,
         }
         return
-    assert option is not None and content is not None
-    code = None
-    chart_js = wrap_code(option, code, chosen_type)
+    # code 模式：LLM 直接给了 JS 代码（含 chart.setOption(option) 调用）
+    #   → 让前端 sandbox 执行，提取 option 用于渲染
+    # option 模式：LLM 给了 JSON option
+    #   → 用 wrap_code 把它包装成 JS（供"代码"标签页展示）
+    chart_js = code or wrap_code(option or {}, chosen_type)
 
     # ---- 8) 保存到默认会话 ----
     chat_id = ensure_default_chat()
@@ -947,6 +998,9 @@ def run_chart_pipeline(
         "type_reason": type_reason,
         "option": option,
         "code": chart_js,
+        # 区分 code 模式（LLM 直接输出 JS 代码）与 option 模式（仅 JSON）
+        # 前端用 is_code_mode 决定是直接 setOption 还是先跑 sandbox 提取
+        "is_code_mode": bool(code),
         "content": content,
         # 兼容字段：旧前端 / 旧消息会读 explanation
         "explanation": content,
@@ -994,16 +1048,11 @@ def api_chat_messages(chat_id: str):
 
 
 
-def wrap_code(option: dict, llm_code: Optional[str], chart_type: str) -> str:
+def wrap_code(option: dict, chart_type: str) -> str:
+    """生成可在前端 chart 容器内直接运行的 JavaScript 代码。
+
+    用户前端只需 ``chart.setOption(option)`` 即可生效（前端从 ``data.code`` 直接复制）。
     """
-    生成一段可在前端 chart 容器内直接运行的 JavaScript 代码。
-    用户前端只需：
-      const chart = echarts.init(document.getElementById('chart'));
-      eval(返回代码);  // 或解析后 chart.setOption(option)
-    这里返回一份包含 option 与 setOption 的完整代码字符串。
-    """
-    if llm_code and "setOption" in llm_code:
-        return llm_code
     option_js = json.dumps(option, ensure_ascii=False, indent=2)
     return (
         f"// 图表类型：{chart_type}\n"

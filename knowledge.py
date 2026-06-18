@@ -2,12 +2,7 @@
 """本地 ECharts 配置项指导知识库（离线内置，不依赖联网搜索）。
 内容参考自 Apache ECharts 官方配置项文档（https://echarts.apache.org/zh/option.html），
 经过人工整理与缩写，作为生成图表时给 LLM 的提示信息。"""
-import json
-import os
-from typing import Dict, List, Any
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-KB_FILE = os.path.join(BASE_DIR, "knowledge_base.json")
+from typing import Dict, List
 
 
 # ------------------------- 核心通用配置项说明 -------------------------
@@ -279,22 +274,3 @@ def search_knowledge(query: str) -> Dict[str, str]:
         # 默认返回 bar 供参考
         hits["图表类型：bar"] = BAR
     return hits
-
-
-def dump_to_file(path: str = KB_FILE) -> None:
-    payload = {
-        "general": GENERAL,
-        "tooltip": TOOLTIP,
-        "legend": LEGEND,
-        "axis": AXIS,
-        "types": TYPE_BODY,
-        "type_aliases": TYPE_MAP,
-    }
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-if __name__ == "__main__":
-    dump_to_file()
-    print(f"已写入本地知识库：{KB_FILE}")

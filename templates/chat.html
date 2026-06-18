@@ -11,7 +11,16 @@
 <div class="app">
   <aside class="sidebar">
     <div class="brand">
-      <div class="brand-logo">EA</div>
+      <div class="brand-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v18h18" />
+          <path d="M7 14l3-4 3 3 5-7" />
+          <circle cx="7" cy="14" r="1.2" fill="currentColor" stroke="none" />
+          <circle cx="10" cy="10" r="1.2" fill="currentColor" stroke="none" />
+          <circle cx="13" cy="13" r="1.2" fill="currentColor" stroke="none" />
+          <circle cx="18" cy="6" r="1.2" fill="currentColor" stroke="none" />
+        </svg>
+      </div>
       <div class="brand-text">
         <div class="brand-title">ECharts Agent</div>
         <div class="brand-sub">数据可视化对话助手</div>
@@ -28,7 +37,7 @@
           </label>
           <span id="fileName" class="file-name">未选择文件</span>
         </div>
-        <textarea id="textInput" rows="4" placeholder="也可直接粘贴 CSV / JSON / 文本数据…"></textarea>
+        <textarea id="textInput" rows="4" aria-label="数据文本输入框" placeholder="也可直接粘贴 CSV / JSON / 文本数据…"></textarea>
         <label class="check-row" title="对不规范数据（多级表头、含单位、合计行、错位等）让大模型先整理">
           <input type="checkbox" id="useLlmChk" />
           <span>🧠 用 LLM 智能整理数据（适合不规范数据）</span>
@@ -58,7 +67,10 @@
         <div id="dataSummary" class="data-summary hidden"></div>
         <div class="row data-preview-actions hidden" id="dataPreviewActions">
           <span class="muted-small" style="flex:1">预览（前 5 行 + schema）</span>
-          <button class="btn btn-ghost btn-mini" id="btnTogglePreview" type="button" title="展开 / 收起数据预览">📊 展开数据 ▾</button>
+          <button class="btn btn-ghost btn-mini" id="btnTogglePreview" type="button" title="展开 / 收起数据预览">
+            <span id="btnTogglePreviewIcon" aria-hidden="true">▾</span>
+            <span id="btnTogglePreviewText">展开数据</span>
+          </button>
         </div>
         <pre id="dataPreview" class="data-preview hidden"></pre>
       </div>
@@ -108,7 +120,7 @@
         <span>3. 发送需求</span>
         <span class="muted-small kbd-hint" title="在 prompt / 数据输入框内按 Ctrl+Enter 直接生成">Ctrl/⌘ + Enter</span>
       </div>
-      <textarea id="promptInput" rows="3" placeholder="例如：用数据里的「月份」作 X 轴，「销售额」作 Y 轴，生成柱状图并带圆角。"></textarea>
+      <textarea id="promptInput" rows="3" aria-label="需求描述输入框" placeholder="例如：用数据里的「月份」作 X 轴，「销售额」作 Y 轴，生成柱状图并带圆角。"></textarea>
       <label class="check-row" title="对不规范数据（多级表头、含单位、合计行等）让大模型先整理；解析阶段没勾 🧠 也能在这里补救">
         <input type="checkbox" id="understandChk" />
         <span>🧠 用 LLM 智能整理数据（生成时）</span>
@@ -151,48 +163,7 @@
         </div>
         <div class="gen-panel-body" id="genPanelBody">
           <ol class="gen-stages" id="genStages">
-            <li class="gen-stage" data-stage="prepare">
-              <span class="gen-stage-icon">○</span>
-              <div class="gen-stage-body">
-                <div class="gen-stage-label">数据准备</div>
-                <div class="gen-stage-detail"></div>
-              </div>
-            </li>
-            <li class="gen-stage" data-stage="understand">
-              <span class="gen-stage-icon">○</span>
-              <div class="gen-stage-body">
-                <div class="gen-stage-label">智能数据整理</div>
-                <div class="gen-stage-detail"></div>
-              </div>
-            </li>
-            <li class="gen-stage" data-stage="preprocess">
-              <span class="gen-stage-icon">○</span>
-              <div class="gen-stage-body">
-                <div class="gen-stage-label">数据预处理</div>
-                <div class="gen-stage-detail"></div>
-              </div>
-            </li>
-            <li class="gen-stage" data-stage="pick_type">
-              <span class="gen-stage-icon">○</span>
-              <div class="gen-stage-body">
-                <div class="gen-stage-label">选择图表类型</div>
-                <div class="gen-stage-detail"></div>
-              </div>
-            </li>
-            <li class="gen-stage" data-stage="generate">
-              <span class="gen-stage-icon">○</span>
-              <div class="gen-stage-body">
-                <div class="gen-stage-label">生成图表配置</div>
-                <div class="gen-stage-detail"></div>
-              </div>
-            </li>
-            <li class="gen-stage" data-stage="parse">
-              <span class="gen-stage-icon">○</span>
-              <div class="gen-stage-body">
-                <div class="gen-stage-label">解析与校验</div>
-                <div class="gen-stage-detail"></div>
-              </div>
-            </li>
+            <!-- 6 个阶段的 <li> 由 app.js 的 initGenStages() 动态生成，避免 HTML 模板重复 -->
           </ol>
           <div class="gen-stream hidden" id="genStreamWrap">
             <div class="gen-stream-head">
@@ -251,6 +222,19 @@
       </div>
 
       <div class="form-group">
+        <label>Provider <small>默认按 Base URL 自动识别；如有偏差可在此手动覆盖</small></label>
+        <div class="row provider-row">
+          <select id="provider" class="grow">
+            <option value="">自动识别（按 Base URL 嗅探）</option>
+            <option value="openai">OpenAI 兼容（OpenAI / DeepSeek / DashScope 等）</option>
+            <option value="ollama">Ollama（本地 / 11434 端口）</option>
+            <option value="glm">GLM 智谱（bigmodel.cn）</option>
+          </select>
+          <span id="providerHint" class="muted-small provider-hint" aria-live="polite"></span>
+        </div>
+      </div>
+
+      <div class="form-group">
         <label>API Key <small>明文保存在本地 SQLite，仅本机使用；不会上传到任何第三方</small></label>
         <div id="apiKeyStatus" class="key-status hidden">
           <span>已配置：<code id="apiKeyMasked"></code></span>
@@ -286,10 +270,10 @@
         </label>
       </div>
 
-        <div class="form-group">
-          <label>系统提示词（System Prompt）<small>留空将使用默认（推荐）—— 内置硬约束 + 最小可用结构示例。</small></label>
-          <textarea id="sysPrompt" rows="5" placeholder="你是一名资深的 Apache ECharts 图表工程师…（留空用默认）"></textarea>
-        </div>
+      <div class="form-group">
+        <label>系统提示词（System Prompt）<small>留空将使用默认（推荐）—— 内置硬约束 + 双模式 + 最小可用结构示例。</small></label>
+        <textarea id="sysPrompt" rows="5" placeholder="你是一名资深的 Apache ECharts 图表工程师…（留空用默认）"></textarea>
+      </div>
 
       <div id="testResult" class="hint hidden"></div>
     </div>

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ECharts Agent · Sandbox</title>
+  <style>
+    body { margin: 0; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+           background: #f5f7fb; color: #334155; }
+    #msg { padding: 16px; font-size: 12px; }
+    .err { color: #c0392b; }
+  </style>
+</head>
+<body>
+  <div id="msg">Sandbox ready, waiting for code...</div>
+  <script>
+    // ECharts Agent · sandbox
+    // 职责：在 null-origin iframe 里执行 LLM 生成的 JS 代码，捕获 chart.setOption(option)
+    //       的 option，postMessage 给父页面。主页面负责真正渲染。
+    //
+    // 安全：父页面创建 iframe 时设 sandbox="allow-scripts"（无 allow-same-origin），
+    //      所以这个脚本运行在 null origin 下，无法访问父页面的 cookie / localStorage。
+    //
+    // 关键：postMessage 用 structured clone，函数无法被克隆。
+    //      因此 option 里的所有函数需要先 toString 成 ``{__fn__: true, src: "..."}`` 标记对象，
+    //      由主页面在收到后用 ``new Function`` 还原。
+
+    (function () {
+      let capturedOption = null;
+
+      // 模拟 chart 对象：setOption 捕获 option，其它方法 no-op
+      const chart = {
+        setOption(opt) {
+          capturedOption = opt;
+          return capturedOption;
+        },
+        resize() {}, dispose() {}, on() {}, off() {}, getOption() { return capturedOption; },
+        getDom() { return { clientWidth: 600, clientHeight: 400 }; },
+      };
+
+      // 模拟 echarts：init() 返回上面的 chart（方便 LLM 写 ``echarts.init(el).setOption(option)``）
+      const echarts = {
+        init() { return chart; },
+        registerTheme() {},
+        registerMap() {},
+        getInstanceByDom() { return chart; },
+        dispose() {},
+      };
+
+      // 递归把 value 里的所有函数 toString 化（postMessage 友好）。
+      // 不破坏其它类型；遇到循环引用安全降级。
+      function serializeOption(value, seen) {
+        seen = seen || new WeakSet();
+        if (value == null) return value;
+        if (typeof value === "function") {
+          return { __fn__: true, src: value.toString() };
+        }
+        if (typeof value !== "object") return value;
+        if (seen.has(value)) return null;
+        seen.add(value);
+        if (Array.isArray(value)) {
+          return value.map(function (v) { return serializeOption(v, seen); });
+        }
+        var out = {};
+        for (var k in value) {
+          if (Object.prototype.hasOwnProperty.call(value, k)) {
+            out[k] = serializeOption(value[k], seen);
+          }
+        }
+        return out;
+      }
+
+      // 等父页面 postMessage 派发代码
+      window.addEventListener("message", function (e) {
+        const data = e.data || {};
+        if (data.type === "ready") return;  // 父页面的 ready 探针
+        const { code: userCode, id } = data;
+        if (typeof userCode !== "string") {
+          window.parent.postMessage({ id, error: "No code provided" }, "*");
+          return;
+        }
+        capturedOption = null;
+        try {
+          // 在隔离作用域里执行 LLM 代码。chart / echarts / window 都以参数注入。
+          // 用 new Function 而不是 eval：略安全（不在当前闭包执行），
+          // 但仍能在 null origin 下访问 fetch / WebSocket 等。
+          const fn = new Function("chart", "echarts", "window", "document",
+                                  "return (function(){\n" + userCode + "\n})();");
+          fn(chart, echarts, window, document);
+          if (capturedOption) {
+            window.parent.postMessage({ id, option: serializeOption(capturedOption) }, "*");
+          } else {
+            window.parent.postMessage({
+              id,
+              error: "代码执行完毕但未调用 chart.setOption(option) —— 请确认 LLM 输出的 code 字段是 ``const option = {...}; chart.setOption(option);`` 这种结构"
+            }, "*");
+          }
+        } catch (err) {
+          window.parent.postMessage({
+            id,
+            error: "代码执行错误: " + String((err && err.message) || err)
+          }, "*");
+        }
+      });
+
+      // 通知父页面：sandbox 已就绪
+      try {
+        window.parent.postMessage({ type: "ready" }, "*");
+      } catch (e) { /* parent not ready yet */ }
+    })();
+  </script>
+</body>
+</html>

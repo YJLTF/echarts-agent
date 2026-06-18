@@ -83,10 +83,16 @@ html, body {
   background: linear-gradient(135deg, var(--primary), #73a0fa);
   color: #fff;
   display: flex; align-items: center; justify-content: center;
-  font-weight: 700; letter-spacing: 1px;
+  box-shadow: 0 2px 8px rgba(84, 112, 198, 0.32);
+  transition: transform .2s ease, box-shadow .2s ease;
 }
-.brand-title { font-weight: 700; font-size: 16px; }
-.brand-sub { color: var(--muted); font-size: 12px; }
+.brand:hover .brand-logo {
+  transform: rotate(-6deg) scale(1.05);
+  box-shadow: 0 4px 12px rgba(84, 112, 198, 0.42);
+}
+.brand-title { font-weight: 700; font-size: 16px; letter-spacing: 0.2px; }
+.brand-sub { color: var(--muted); font-size: 12px; margin-top: 1px; }
+.brand-text { display: flex; flex-direction: column; min-width: 0; }
 
 .spacer { flex: 1; }
 .grow { flex: 1; min-width: 0; }
@@ -146,6 +152,16 @@ textarea:focus, input:focus, select:focus {
   border-color: var(--primary);
   box-shadow: 0 0 0 3px rgba(84,112,198,.15);
 }
+/* 自定义 select 箭头（统一 UI 风格） */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%2394a3b8' d='M1 1l4 4 4-4z'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 26px;
+  cursor: pointer;
+}
 
 .row {
   display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
@@ -166,9 +182,26 @@ textarea:focus, input:focus, select:focus {
   border-radius: 8px;
   cursor: pointer;
   font-size: 13px;
-  transition: background .15s, border-color .15s, transform .05s;
+  transition: background .15s, border-color .15s, color .15s, transform .05s, box-shadow .15s;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
-.btn:hover { background: var(--panel-2); }
+/* 通用按钮 hover —— 注意：用 :not(:disabled) 让 .btn-primary:hover/.btn-ghost:hover
+   也能用同样的特异度 (0,2,1) 覆盖它，避免 primary 按钮 hover 时背景被强制成 panel-2 */
+.btn:hover:not(:disabled):not(.btn-primary):not(.btn-ghost) {
+  background: var(--panel-2);
+  border-color: #d4dae6;
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--panel-2);
+  border-color: #d4dae6;
+}
+.btn:focus-visible {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(84, 112, 198, .15);
+}
 .btn:active { transform: translateY(1px); }
 .btn:disabled,
 .btn[disabled] {
@@ -201,7 +234,7 @@ textarea:focus, input:focus, select:focus {
   border-color: var(--primary);
   color: #fff;
 }
-.btn-primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+.btn-primary:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
 .btn-ghost { background: transparent; }
 
 .data-summary {
@@ -396,7 +429,7 @@ textarea:focus, input:focus, select:focus {
   transition: color .15s, border-color .15s;
 }
 .tab.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
-.tab:hover { color: var(--primary); }
+.tab:hover:not(.active) { color: var(--text); }
 
 .tab-panels {
   background: var(--code-bg);
@@ -425,7 +458,7 @@ textarea:focus, input:focus, select:focus {
   white-space: pre-wrap;
   word-break: break-word;
 }
-/* 复制按钮：浮在右上角，只在 wrap 显示时露出 */
+/* 复制按钮：浮在右上角，hover/focus 时显示；触屏永久半透 */
 .tab-copy {
   position: absolute;
   top: 8px;
@@ -445,6 +478,12 @@ textarea:focus, input:focus, select:focus {
 .tab-copy:focus-visible { opacity: 1; }
 .tab-copy:hover { background: rgba(255, 255, 255, 0.18); }
 .tab-copy.copied { background: var(--accent); color: #0f172a; border-color: transparent; opacity: 1; }
+
+/* 触屏设备（无 hover 能力）：复制按钮保持半透明常显，避免操作盲区 */
+@media (hover: none) {
+  .tab-copy { opacity: 0.55; }
+  .tab-copy:active { opacity: 1; }
+}
 
 /* ------ Form group (used by config modal) ------ */
 .form-group {
@@ -474,8 +513,18 @@ textarea:focus, input:focus, select:focus {
 
 /* Responsive */
 @media (max-width: 1024px) {
-  .app { grid-template-columns: 1fr; }
-  .sidebar { border-right: none; border-bottom: 1px solid var(--border); height: auto; max-height: 70vh; }
+  .app {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    height: auto;
+    min-height: 0;
+  }
+  .main { height: auto; min-height: 0; }
+  .chart { height: clamp(280px, 42vh, 420px); }
 }
 
 /* ------ Sheet picker (multi-sheet xlsx) ------ */
@@ -728,6 +777,25 @@ textarea:focus, input:focus, select:focus {
   padding: 4px 10px;
   font-size: 12px;
 }
+
+/* Provider 行：select + 嗅探/对比提示横排 */
+.provider-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  transition: background .15s, color .15s, border-color .15s;
+}
+/* 手动指定且与嗅探不一致时，用蓝色提示引起注意 */
+.provider-hint.provider-hint-override {
+  color: #1857b0;
+  background: #f0f7ff;
+  border-color: #d0e2fb;
+}
 @keyframes modal-fade-in {
   from { opacity: 0; }
   to   { opacity: 1; }
@@ -962,7 +1030,7 @@ textarea:focus, input:focus, select:focus {
 .gen-stream-text::-webkit-scrollbar,
 .data-preview::-webkit-scrollbar,
 .tab-panels::-webkit-scrollbar,
-.configModal textarea::-webkit-scrollbar { width: 8px; height: 8px; }
+#configModal textarea::-webkit-scrollbar { width: 8px; height: 8px; }
 .gen-stream-text::-webkit-scrollbar-thumb,
 .data-preview::-webkit-scrollbar-thumb,
 .tab-panels::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
