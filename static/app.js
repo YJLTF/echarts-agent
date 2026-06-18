@@ -1261,10 +1261,16 @@
 
   $("#btnExport").addEventListener("click", async () => {
     if (!state.lastResp) return showHint("先生成一个图表再导出。", true);
-    const opt = JSON.stringify(state.lastResp.option, null, 2);
+    const isCodeMode = !!state.lastResp.is_code_mode;
+    // 优先用 LLM 提供的 / 服务器 wrap 出来的 code（两种模式都有值），
+    // 极端情况下 code 缺失再退回 option JSON。
+    const code = state.lastResp.code || (state.lastResp.option
+      ? `const option = ${JSON.stringify(state.lastResp.option, null, 2)};\nchart.setOption(option);`
+      : "");
+    if (!code) return showHint("当前结果缺少可导出的图表代码，请重新生成。", true);
     try {
       const themeName = state.chartTheme ? "dark" : "light";
-      const html = await buildExportHtml(opt, state.lastResp.chart_type, themeName);
+      const html = await buildExportHtml(code, isCodeMode, state.lastResp.chart_type, themeName);
       const blob = new Blob([html], { type: "text/html;charset=utf-8" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
@@ -1295,33 +1301,61 @@
     return text;
   }
 
-  async function buildExportHtml(optionJSON, type, theme) {
-    // 内联 ECharts 主库 + 主题，导出的 HTML 完全自包含，不依赖任何 CDN
+  async function buildExportHtml(code, isCodeMode, type, theme) {
+    // 内联 ECharts 主库 + 主题，导出的 HTML 完全自包含，不依赖任何 CDN。
+    // 注意：下面的拼接全部用字符串 + 拼接，禁用模板字面量 —— 模板字面量里的反引号
+    //   （包括注释里想用 ``code`` 给变量加格式的那种）会提前闭合外层 literal，
+    //   让整个函数解析失败（V8 报 "is not a function"），改用 + 拼接彻底规避。
     const echartsSrc = await _loadVendor("/static/vendor/echarts/echarts.min.js");
-    const themeBlock = theme === "dark"
-      ? `<script>\n${await _loadVendor("/static/vendor/echarts/dark.js")}\n<\/script>`
-      : "";
-    return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8" />
-<title>ECharts · ${type}</title>
-<style>html,body{margin:0;padding:0;height:100%;background:${theme==='dark'?'#0f172a':'#f5f7fb'}}#chart{width:100%;height:100vh}</style>
-<script>
-${echartsSrc}
-<\/script>
-${themeBlock}
-</head>
-<body>
-<div id="chart"></div>
-<script>
-const chart = echarts.init(document.getElementById('chart')${theme==='dark'?",'dark'":''});
-const option = ${optionJSON};
-chart.setOption(option);
-window.addEventListener('resize',()=>chart.resize());
-<\/script>
-</body>
-</html>`;
+    let themeBlock = "";
+    if (theme === "dark") {
+      const darkSrc = await _loadVendor("/static/vendor/echarts/dark.js");
+      themeBlock = "<script>\n" + darkSrc + "\n<\/script>";
+    }
+    // 防御性 escape：LLM 输出里若出现 "</script>"，HTML 解析器会提前闭合 <script> 标签，
+    //   把后续 HTML 当脚本执行。把 </script 改成 <\/script —— HTML 解析器在 script-data 状态
+    //   只识别 "<\/script" + 标签终结符（空白 / / >），中间插入一个 \ 就能骗过 HTML parser；
+    //   JS 解析器看到 `<\/script>` 与 `</script>` 等价，所以代码运行时语义不变。
+    const safeCode = String(code).replace(/<\/script/gi, "<\\/script");
+    const initOpts = theme === "dark" ? ", 'dark'" : "";
+    let banner = "";
+    if (isCodeMode) {
+      const bannerColor = "#94a3b8";
+      const bannerBg = theme === "dark" ? "rgba(15,23,42,0.7)" : "rgba(255,255,255,0.7)";
+      banner = '<div style="position:fixed;bottom:8px;right:12px;font:11px/1 ui-monospace,Menlo,monospace;color:' + bannerColor + ';background:' + bannerBg + ';padding:4px 8px;border-radius:4px;pointer-events:none">⚡ ECharts Agent · Code 模式</div>';
+    }
+    const bg = theme === "dark" ? "#0f172a" : "#f5f7fb";
+    return "<!DOCTYPE html>\n" +
+      "<html>\n" +
+      "<head>\n" +
+      '<meta charset="utf-8" />\n' +
+      "<title>ECharts · " + type + "</title>\n" +
+      "<style>html,body{margin:0;padding:0;height:100%;background:" + bg + "}#chart{width:100%;height:100vh}</style>\n" +
+      "<script>\n" + echartsSrc + "\n<\/script>\n" +
+      themeBlock + "\n" +
+      "</head>\n" +
+      "<body>\n" +
+      '<div id="chart"></div>\n' +
+      banner + "\n" +
+      "<script>\n" +
+      "(function(){\n" +
+      "  const chart = echarts.init(document.getElementById('chart')" + initOpts + ");\n" +
+      "  try {\n" +
+      "    (function(chart){\n" +
+      safeCode + "\n" +
+      "    })(chart);\n" +
+      "  } catch (e) {\n" +
+      '    var msg = (e && e.message) || String(e);\n' +
+      "    var pre = document.createElement('pre');\n" +
+      "    pre.style.cssText = 'position:fixed;top:8px;left:8px;right:8px;padding:10px 12px;background:#fef2f2;border:1px solid #fca5a5;color:#b91c1c;font:12px/1.5 ui-monospace,Menlo,monospace;border-radius:6px;white-space:pre-wrap;z-index:9999';\n" +
+      "    pre.textContent = '代码执行失败：' + msg;\n" +
+      "    document.body.appendChild(pre);\n" +
+      "  }\n" +
+      "  window.addEventListener('resize', function(){ try { chart.resize(); } catch (e) {} });\n" +
+      "})();\n" +
+      "<\/script>\n" +
+      "</body>\n" +
+      "</html>";
   }
 
   // -------- Config modal ----------

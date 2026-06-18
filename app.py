@@ -4,7 +4,10 @@ import json
 import os
 import re
 import sqlite3
+import sys
+import threading
 import traceback
+import webbrowser
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Optional
@@ -28,9 +31,26 @@ from data_preprocessing import preprocess_data
 from knowledge import search_knowledge, get_knowledge_for_type
 import prompts
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-DB_PATH = os.path.join(BASE_DIR, "app.db")
+# PyInstaller 冻结后：``__file__`` 指向 _MEIPASS（只读、临时）。
+# 资源文件（templates / static）从 ``sys._MEIPASS`` 取；
+# 运行时数据（app.db、用户上传文件）放到 %LOCALAPPDATA% 下，避免只读问题。
+_IS_FROZEN = getattr(sys, "frozen", False)
+_MEIPASS = getattr(sys, "_MEIPASS", None)
+
+if _IS_FROZEN and _MEIPASS:
+    BASE_DIR = _MEIPASS
+    if os.name == "nt":
+        _user_data_root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        _user_data_root = os.path.expanduser("~/.local/share")
+    _RUNTIME_ROOT = os.path.join(_user_data_root, "EChartsAgent")
+    os.makedirs(_RUNTIME_ROOT, exist_ok=True)
+    DATA_DIR = os.path.join(_RUNTIME_ROOT, "data")
+    DB_PATH = os.path.join(_RUNTIME_ROOT, "app.db")
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DATA_DIR = os.path.join(BASE_DIR, "data")
+    DB_PATH = os.path.join(BASE_DIR, "app.db")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 app = Flask(
@@ -1062,12 +1082,36 @@ def wrap_code(option: dict, chart_type: str) -> str:
 
 
 # ---------------------- Main ----------------------
+def _open_browser_when_ready(url: str, delay: float = 1.5) -> None:
+    """延迟打开浏览器；用线程避免阻塞 Flask 启动。"""
+    import time
+
+    def _runner():
+        time.sleep(delay)
+        try:
+            webbrowser.open_new(url)
+        except Exception:
+            pass
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", "8080"))
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
+    open_browser = parse_bool(os.environ.get("OPEN_BROWSER", "1"))
     print(f"[ECharts Agent] starting on http://{host}:{port}")
     print(f"[ECharts Agent] using Flask dev server (threaded, streaming-friendly)")
+    if _IS_FROZEN:
+        print(f"[ECharts Agent] data dir: {_RUNTIME_ROOT}")
+    if open_browser and host in ("127.0.0.1", "localhost", "0.0.0.0"):
+        display_host = "127.0.0.1" if host == "0.0.0.0" else host
+        _open_browser_when_ready(f"http://{display_host}:{port}/")
     # Flask 开发服务器 + threaded=True 原生支持流式响应逐 chunk flush；
     # waitress 会缓冲响应体，不适合 SSE 流式。
-    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
+    try:
+        app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
+    except KeyboardInterrupt:
+        print("\n[ECharts Agent] shutting down")
+        sys.exit(0)

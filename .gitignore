@@ -11,3 +11,5 @@ app.db
 # 可能包含密钥的备份
 *.bak
 data/
+build/
+dist/

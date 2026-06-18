@@ -66,6 +66,24 @@ python app.py
 PORT=8000 python app.py
 ```
 
+### 打包为 Windows 单文件 .exe
+
+仓库自带 `echarts-agent.spec`，可在 Windows 上用 PyInstaller 一键打包（仅 Windows 环境）：
+
+```powershell
+pip install pyinstaller
+pyinstaller echarts-agent.spec --noconfirm --clean
+```
+
+产物：`dist\echarts-agent.exe`（约 44 MB，单文件，含 ECharts 内嵌）。
+
+**运行特性：**
+- 启动后自动打开默认浏览器到 `http://127.0.0.1:8080/`
+- 关闭浏览器窗口无法停服务；按 **Ctrl + C** 结束
+- 运行时数据（`app.db`、上传的 Excel/CSV、生成的临时文件）写到 `%LOCALAPPDATA%\EChartsAgent\`，**不会污染 exe 所在目录**
+- 模板与静态资源从 PyInstaller 的解压目录加载，对源代码 0 侵入
+- 环境变量：`PORT=9000`、`HOST=0.0.0.0`、`OPEN_BROWSER=0`（关闭自动开浏览器）
+
 ### 配置 LLM
 
 1. 打开 http://127.0.0.1:8080/config
